@@ -103,5 +103,3 @@ dumps/
 ```
 
 Open `_fixed.exe` in IDA, Ghidra, or x64dbg directly.
-
-> **Disclaimer:** This tool is intended strictly for educational purposes — reverse engineering, malware analysis, and understanding how executable formats and memory management work at a low level. Do not use this tool on software you do not own or have explicit permission to analyse. The author takes no responsibility for any misuse.
