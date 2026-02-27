@@ -20,9 +20,10 @@ Original page walker logic by [zarboz on UnknownCheats](https://www.unknowncheat
 ```
 universal_dma_dumper/
 ├── libs/
-│   ├── vmmdll.h
+│   ├── leechcore.lib
+│   ├── leechcore.h
 │   ├── vmmdll.lib
-│   └── vmm.dll
+│   └── vmmdll.h
 ├── src/
 │   └── main.cpp
 └── README.md
