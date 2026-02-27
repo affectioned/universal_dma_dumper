@@ -1,0 +1,7 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="universal_dma_dumper/universal_dma_dumper.vcxproj" Id="1d0493f1-5bba-47b4-a2e2-0710028400cf" />
+</Solution>
