@@ -53,8 +53,6 @@ bool GetModuleInfo(DWORD pid, std::string_view moduleName, ULONG64& outBase, DWO
 }
 
 // ============================================================
-//  PageWalker
-//
 //  Walks the module region one 4KB page at a time.
 //  Pages that are blank or still encrypted are skipped and
 //  retried on the next pass — the loop keeps running until
@@ -139,8 +137,6 @@ static void PageWalker(DWORD pid, ULONG64 base, DWORD imageSize, const std::stri
 }
 
 // ============================================================
-//  FixPE
-//
 //  The raw dump file has the module in its memory layout:
 //  section data is at its VirtualAddress (RVA) offset.
 //  A proper PE file on disk has section data at PointerToRawData.
