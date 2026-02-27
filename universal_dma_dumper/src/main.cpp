@@ -9,19 +9,17 @@ std::string g_outDir = "./dumps";
 bool g_running = true;
 
 // ============================================================
-//  is_encrypted / is_blank
-//
 //  Some games encrypt pages at rest and decrypt them on demand
 //  at runtime — this is implemented by the developers themselves.
 //  Not-yet-decrypted pages are filled with 0xCC,
 //  uncommitted/not-yet-paged-in memory shows as all 0x00.
 //  We skip both and retry on the next pass.
 // ============================================================
-static bool is_encrypted(std::span<const uint8_t> buf) {
+static bool IsEncrypted(std::span<const uint8_t> buf) {
     return std::ranges::all_of(buf, [](uint8_t b) { return b == 0xCC; });
 }
 
-static bool is_blank(std::span<const uint8_t> buf) {
+static bool IsBlank(std::span<const uint8_t> buf) {
     return std::ranges::all_of(buf, [](uint8_t b) { return b == 0x00; });
 }
 
@@ -107,7 +105,7 @@ static void PageWalker(DWORD pid, ULONG64 base, DWORD imageSize, const std::stri
                 &bytesRead, VMMDLL_FLAG_ZEROPAD_ON_FAIL))
                 continue;
 
-            if (is_blank(pageBuf) || is_encrypted(pageBuf))
+            if (IsBlank(pageBuf) || IsEncrypted(pageBuf))
                 continue; // page still encrypted or not yet committed — retry next pass
 
             outf.seekp(static_cast<std::streamoff>(addr - base));
@@ -154,7 +152,7 @@ static void PageWalker(DWORD pid, ULONG64 base, DWORD imageSize, const std::stri
 //
 //  The result opens correctly in IDA/Ghidra/x64dbg.
 // ============================================================
-static bool FixPE(const std::string& dumpFile, const std::string& peFile) {
+static bool FixPEFromMemory(const std::string& dumpFile, const std::string& peFile) {
     std::ifstream dump(dumpFile, std::ios::binary);
     if (!dump) return false;
     dump.seekg(0, std::ios::end);
@@ -297,7 +295,7 @@ int main(int argc, char* argv[]) {
     //  Fix PE layout
     // --------------------------------------------------------
     std::cout << "\n[*] Fixing PE layout...\n";
-    if (!FixPE(rawFile, fixedFile)) {
+    if (!FixPEFromMemory(rawFile, fixedFile)) {
         std::cerr << std::format("[!] FixPE failed — raw dump is still at: {}\n", rawFile);
         VMMDLL_Close(g_hVMM);
         return 1;
