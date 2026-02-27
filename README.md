@@ -4,6 +4,8 @@ Universal DMA-based process dumper for Windows. Walks memory page by page with e
 
 Original page walker logic by [zarboz on UnknownCheats](https://www.unknowncheats.me/forum/4595235-post1774.html).
 
+> **Disclaimer:** This tool is intended strictly for educational purposes — reverse engineering, malware analysis, and understanding how executable formats and memory management work at a low level. Do not use this tool on software you do not own or have explicit permission to analyse. The author takes no responsibility for any misuse.
+
 ---
 
 ## Requirements
@@ -101,3 +103,5 @@ dumps/
 ```
 
 Open `_fixed.exe` in IDA, Ghidra, or x64dbg directly.
+
+> **Disclaimer:** This tool is intended strictly for educational purposes — reverse engineering, malware analysis, and understanding how executable formats and memory management work at a low level. Do not use this tool on software you do not own or have explicit permission to analyse. The author takes no responsibility for any misuse.
