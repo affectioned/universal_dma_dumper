@@ -1,5 +1,8 @@
 #include "pch.h"
 
+// based off https://www.unknowncheats.me/forum/4595235-post1774.html
+// original logic credit goes to them
+
 VMM_HANDLE  g_hVMM = nullptr;
 std::string g_outDir = "./dumps";
 
