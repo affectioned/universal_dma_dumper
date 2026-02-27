@@ -10,7 +10,7 @@ Original page walker logic by [zarboz on UnknownCheats](https://www.unknowncheat
 
 - Windows x64
 - DMA device (FPGA / PCILeech)
-- [MemProcFS](https://github.com/ufrisk/MemProcFS/releases) — `vmmdll.h`, `vmmdll.lib`, `vmm.dll`
+- [MemProcFS](https://github.com/ufrisk/MemProcFS/releases) — `vmdll.h`, `vmmdll.lib`, `leechcore.h`, `leechcore.lib`,
 - Visual Studio 2022 with C++20
 
 ---
