@@ -123,8 +123,8 @@ static void PageWalker(DWORD pid, ULONG64 base, DWORD imageSize, const std::stri
 
         // Timeout: bail out after 15 minutes regardless
         if (std::chrono::steady_clock::now() - startTime > std::chrono::minutes(15)) {
-            std::cout << std::format("[!] 15-minute timeout reached ({}/{} pages dumped).\n",
-                dumpedPages.size(), totalPages);
+            std::cout << std::format("[!] 15-minute timeout reached ({}/{} pages dumped, {:.1f}% coverage).\n",
+                dumpedPages.size(), totalPages, coverage * 100.0);
             break;
         }
 
