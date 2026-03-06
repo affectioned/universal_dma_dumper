@@ -215,23 +215,36 @@ static bool FixPEFromMemory(const std::string& dumpFile, const std::string& peFi
 int main(int argc, char* argv[]) {
     std::cout << "=== Process Dumper (MemProcFS) ===\n\n";
 
+    // --------------------------------------------------------
+    //  Parse -name (required)
+    // --------------------------------------------------------
     auto it = std::find(argv + 1, argv + argc, std::string_view("-name"));
     if (it == argv + argc || std::next(it) == argv + argc) {
         std::cout << "Usage:\n"
             << "  dumper.exe -name <ProcessName>\n"
-            << "  dumper.exe -name <ProcessName> -out <dir>\n";
+            << "  dumper.exe -name <ProcessName> -module <ModuleName>\n"
+            << "  dumper.exe -name <ProcessName> -module <ModuleName> -out <dir>\n";
         return 1;
     }
     const std::string nameArg = *std::next(it);
 
+    // --------------------------------------------------------
+    //  Parse -module (optional, defaults to process name)
+    // --------------------------------------------------------
+    std::string moduleArg = nameArg;   // default: same as process
+    it = std::find(argv + 1, argv + argc, std::string_view("-module"));
+    if (it != argv + argc && std::next(it) != argv + argc)
+        moduleArg = *std::next(it);
+
+    // --------------------------------------------------------
+    //  Parse -out (optional)
+    // --------------------------------------------------------
     it = std::find(argv + 1, argv + argc, std::string_view("-out"));
     if (it != argv + argc && std::next(it) != argv + argc)
         g_outDir = *std::next(it);
 
     // --------------------------------------------------------
     //  Init MemProcFS
-    //  Change "fpga" to "pmem" for live kernel or a .dmp path
-    //  for offline dump analysis.
     // --------------------------------------------------------
     LPCSTR vmmArgs[] = { (LPSTR)"", (LPSTR)"-device", (LPSTR)"FPGA" };
     std::cout << "[*] Initializing MemProcFS...\n";
@@ -256,8 +269,8 @@ int main(int argc, char* argv[]) {
     // --------------------------------------------------------
     ULONG64 modBase = 0;
     DWORD   modSize = 0;
-    if (!GetModuleInfo(pid, nameArg, modBase, modSize)) {
-        std::cerr << std::format("[!] Could not find module: {}\n", nameArg);
+    if (!GetModuleInfo(pid, moduleArg, modBase, modSize)) {
+        std::cerr << std::format("[!] Could not find module: {}\n", moduleArg);
         VMMDLL_Close(g_hVMM);
         return 1;
     }
