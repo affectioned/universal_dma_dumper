@@ -39,6 +39,7 @@ universal_dma_dumper/
 
 ```
 universal_dma_dumper.exe -name <ProcessName>
+universal_dma_dumper.exe -name <ProcessName> -module <ModuleName>
 universal_dma_dumper.exe -name <ProcessName> -out <dir>
 ```
 
