@@ -213,7 +213,7 @@ static bool FixPEFromMemory(const std::string& dumpFile, const std::string& peFi
 }
 
 int main(int argc, char* argv[]) {
-    std::cout << "=== Process Dumper (MemProcFS) ===\n\n";
+    std::cout << "=== Process Dumper (MemProcFS) ===\n";
 
     // --------------------------------------------------------
     //  Parse -name (required)
@@ -253,7 +253,7 @@ int main(int argc, char* argv[]) {
         std::cerr << "[!] VMMDLL_Initialize failed.\n";
         return 1;
     }
-    std::cout << "[+] Initialized\n\n";
+    std::cout << "[+] Initialized\n";
 
     // --------------------------------------------------------
     //  Find process
@@ -277,7 +277,7 @@ int main(int argc, char* argv[]) {
 
     std::cout << std::format("[*] Module : {}\n", nameArg);
     std::cout << std::format("[*] Base   : 0x{:016X}\n", modBase);
-    std::cout << std::format("[*] Size   : 0x{:08X} ({} KB)\n\n", modSize, modSize / 1024);
+    std::cout << std::format("[*] Size   : 0x{:08X} ({} KB)\n", modSize, modSize / 1024);
 
     // --------------------------------------------------------
     //  Set up output paths
