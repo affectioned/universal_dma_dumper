@@ -275,7 +275,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    std::cout << std::format("[*] Module : {}\n", nameArg);
+    std::cout << std::format("[*] Module : {}\n", moduleArg);
     std::cout << std::format("[*] Base   : 0x{:016X}\n", modBase);
     std::cout << std::format("[*] Size   : 0x{:08X} ({} KB)\n", modSize, modSize / 1024);
 
@@ -284,12 +284,19 @@ int main(int argc, char* argv[]) {
     // --------------------------------------------------------
     std::filesystem::create_directories(g_outDir);
 
-    std::string baseName = nameArg;
-    if (const size_t dot = baseName.rfind('.'); dot != std::string::npos)
+    // Derive baseName and extension from the module being dumped
+    std::string baseName = moduleArg;
+    std::string fixedExt = ".exe";
+    if (const size_t dot = baseName.rfind('.'); dot != std::string::npos) {
+        // Preserve the original extension to distinguish DLLs from EXEs
+        std::string ext = baseName.substr(dot);
+        std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+        if (ext == ".dll") fixedExt = ".dll";
         baseName = baseName.substr(0, dot);
+    }
 
     const std::string rawFile = std::format("{}/{}_raw.bin", g_outDir, baseName);
-    const std::string fixedFile = std::format("{}/{}_fixed.exe", g_outDir, baseName);
+    const std::string fixedFile = std::format("{}/{}_fixed{}", g_outDir, baseName, fixedExt);
 
     // --------------------------------------------------------
     //  Page walk
