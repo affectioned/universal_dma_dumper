@@ -33,6 +33,7 @@
 // std::filesystem::create_directories(g_outDir);
 #include <filesystem>
 
+#define NOMINMAX
 #include "..\libs\vmmdll.h"
 #pragma comment(lib, "leechcore.lib")
 #pragma comment(lib, "vmm.lib")

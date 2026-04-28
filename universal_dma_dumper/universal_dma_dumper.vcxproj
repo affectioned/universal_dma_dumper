@@ -29,6 +29,9 @@
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">Use</PrecompiledHeader>
       <PrecompiledHeaderFile Condition="'$(Configuration)|$(Platform)'=='Release|x64'">pch.h</PrecompiledHeaderFile>
     </ClCompile>
+    <ClCompile Include="src\PageWalker.cpp" />
+    <ClCompile Include="src\PEFixer.cpp" />
+    <ClCompile Include="src\Process.cpp" />
     <ClCompile Include="src\pch.cpp">
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">Create</PrecompiledHeader>
       <PrecompiledHeaderFile Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">pch.h</PrecompiledHeaderFile>
@@ -43,6 +46,10 @@
   <ItemGroup>
     <ClInclude Include="libs\leechcore.h" />
     <ClInclude Include="libs\vmmdll.h" />
+    <ClInclude Include="src\PageWalker.h" />
+    <ClInclude Include="src\PEFixer.h" />
+    <ClInclude Include="src\Process.h" />
+    <ClInclude Include="src\Types.h" />
     <ClInclude Include="src\pch.h" />
   </ItemGroup>
   <ItemGroup>

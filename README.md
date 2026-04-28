@@ -12,7 +12,7 @@ Original page walker logic by [zarboz on UnknownCheats](https://www.unknowncheat
 
 - Windows x64
 - DMA device (FPGA / PCILeech)
-- [MemProcFS](https://github.com/ufrisk/MemProcFS/releases) — `vmdll.h`, `vmmdll.lib`, `leechcore.h`, `leechcore.lib`,
+- [MemProcFS](https://github.com/ufrisk/MemProcFS/releases) — `vmmdll.h`, `vmmdll.lib`, `leechcore.h`, `leechcore.lib`
 - Visual Studio 2022 with C++20
 
 ---
@@ -24,12 +24,15 @@ universal_dma_dumper/
 ├── libs/
 │   ├── leechcore.lib
 │   ├── leechcore.h
-│   ├── vmmdll.lib
+│   ├── vmm.lib
 │   └── vmmdll.h
 ├── src/
 │   ├── main.cpp
-│   ├── pch.cpp
-│   └── pch.h
+│   ├── Types.h
+│   ├── Process.h / Process.cpp
+│   ├── PageWalker.h / PageWalker.cpp
+│   ├── PEFixer.h / PEFixer.cpp
+│   ├── pch.h / pch.cpp
 └── README.md
 ```
 
@@ -39,9 +42,15 @@ universal_dma_dumper/
 
 ```
 universal_dma_dumper.exe -name <ProcessName>
-universal_dma_dumper.exe -name <ProcessName> -module <ModuleName>
+universal_dma_dumper.exe -name <ProcessName> -module <ModuleName.dll>
 universal_dma_dumper.exe -name <ProcessName> -out <dir>
 ```
+
+| Argument | Description |
+|---|---|
+| `-name` | Target process name (e.g. `game.exe`) — required |
+| `-module` | Specific module to dump within that process (e.g. `engine.dll`). Defaults to the process executable itself |
+| `-out` | Output directory. Defaults to `./dumps` |
 
 Press **END** to stop the dump early. The PE fix will still run on whatever was collected.
 
@@ -51,20 +60,24 @@ Press **END** to stop the dump early. The PE fix will still run on whatever was 
 
 ### 1. Page walker
 
-Modern games encrypt their code pages at rest and decrypt them on demand at runtime — this is done by the developers themselves, not anti-cheat. At any given moment only a portion of the module's pages are in their decrypted state in memory.
+Some games encrypt their code pages at rest and decrypt them on demand at runtime — this is done by the developers themselves, not anti-cheat. Pages may start as all `0x00` (uncommitted, not yet executed) and become readable only as the game executes them during normal gameplay.
 
-A naive single-shot read of the entire module will capture a mix of real code and still-encrypted pages filled with `0xCC`, making the dump largely useless.
+A naive single-shot read of the entire module will capture a mix of real code and encrypted or uncommitted pages, making the dump largely useless.
 
 The page walker solves this by reading the module one 4KB page at a time in a continuous retry loop:
 
 1. The output file is pre-allocated to the full module size, filled with zeros, so pages can be written in-place at their correct offsets as they become available.
-2. Each pass iterates every page in the module's address range. Pages that have already been successfully dumped are skipped.
-3. For each unread page, `VMMDLL_MemReadEx` is called with `VMMDLL_FLAG_ZEROPAD_ON_FAIL` — this returns zeros for unreadable pages rather than failing the whole read, so we can detect and skip them.
-4. Pages that are all `0x00` (uncommitted / not yet paged in) or all `0xCC` (not yet decrypted) are skipped and retried on the next pass.
-5. Any page with real content is written into the output file at `offset = pageAddress - moduleBase`, preserving the in-memory layout exactly.
-6. The loop continues until one of three conditions is met: 95%+ page coverage is reached, the 15-minute timeout expires, or the user presses END.
+2. Each pass iterates every unread page in the module's address range.
+3. For each page, `VMMDLL_MemReadEx` is called with `VMMDLL_FLAG_ZEROPAD_ON_FAIL` — this returns zeros for unreadable pages rather than failing, so they can be detected and skipped.
+4. Pages that are all `0x00` (not yet executed) or heavily `0xCC`-filled (not yet decrypted) are skipped and retried next pass.
+5. A candidate page is read **twice** and only accepted if both reads match — this prevents capturing pages that are mid-decryption and contain garbage.
+6. Accepted pages are written into the output file at `offset = pageAddress - moduleBase`.
 
-The result is a raw `.bin` file containing the module in its virtual memory layout — section data sits at each section's RVA from the image base.
+**Termination** happens when any of the following is met: **90% page coverage** is reached, the **15-minute timeout** expires, or **END** is pressed. This allows the walk to keep running through idle periods where pages haven't been decrypted or committed yet, rather than bailing out early.
+
+> For games where pages decrypt only during active gameplay (e.g. in-match but not in menus), run the tool while actively playing to maximise coverage.
+
+The result is a raw `.bin` file containing the module in its virtual memory layout.
 
 ---
 
@@ -72,26 +85,18 @@ The result is a raw `.bin` file containing the module in its virtual memory layo
 
 The raw dump cannot be opened directly in IDA because it is in **memory layout**, not **file layout**.
 
-The difference is:
-
 | | Memory layout | File layout |
 |---|---|---|
 | Section data location | `VirtualAddress` (RVA) | `PointerToRawData` (file offset) |
 | How Windows uses it | Loaded PE mapped into process | PE on disk |
 
-When Windows loads a PE it maps each section to its `VirtualAddress`. So in the raw dump, `.text` is at offset `0x1000` because that is its `VirtualAddress`, not because its `PointerToRawData` says `0x1000`. IDA reads files using `PointerToRawData`, so it would look at the wrong offset and see garbage.
+The fix step rebuilds a proper file-layout PE. It handles several complications common with protected targets:
 
-The fix step rebuilds a proper file-layout PE:
+**Header corruption** — Some protectors zero the in-memory section table and data directories at runtime to defeat memory dumpers. To work around this, the tool queries MemProcFS's internal module database (`VMMDLL_ProcessGetSections`, `VMMDLL_ProcessGetDirectories`) before the walk begins. MemProcFS caches this data at attach time, independently of the process's live virtual memory, so it remains valid even after the game has wiped its own headers. No access to the game's files on disk is required — this works correctly when running on a second PC over DMA.
 
-1. Read the raw dump into a buffer.
-2. Validate the `MZ` signature (`IMAGE_DOS_HEADER.e_magic`) and `PE\0\0` signature (`IMAGE_NT_HEADERS.Signature`).
-3. Check `FileHeader.Machine` to detect x86 vs x64 and read `SizeOfHeaders` from the correct typed struct (`IMAGE_NT_HEADERS32` or `IMAGE_NT_HEADERS64`).
-4. Allocate an output buffer sized to fit the headers plus all sections at their file offsets.
-5. Copy the headers verbatim into the output buffer.
-6. For each section, copy from `rawDump[VirtualAddress]` into `outBuffer[PointerToRawData]` for `SizeOfRawData` bytes.
-7. Write the output buffer to `_fixed.exe`.
+**Layout recalculation** — `PointerToRawData` and `SizeOfRawData` are recalculated from scratch using `VirtualSize` and `FileAlignment` rather than trusting the values in the headers, which protectors also corrupt.
 
-The resulting file has section data where IDA expects it, so it opens and analyses correctly.
+**Data directories** — The security (authenticode) directory is zeroed since the signature is invalid after reconstruction. The exception directory (`.pdata`) is restored from the section table if missing — IDA uses this for x64 function boundary detection.
 
 ---
 
@@ -99,8 +104,8 @@ The resulting file has section data where IDA expects it, so it opens and analys
 
 ```
 dumps/
-├── <ProcessName>_raw.bin     # raw memory-layout dump
-└── <ProcessName>_fixed.exe   # reconstructed file-layout PE
+├── <ModuleName>_raw.bin      # raw memory-layout dump
+└── <ModuleName>_fixed.exe    # reconstructed file-layout PE  (or _fixed.dll for DLL modules)
 ```
 
-Open `_fixed.exe` in IDA, Ghidra, or x64dbg directly.
+The output extension is preserved from the module name — dumping `engine.dll` produces `engine_fixed.dll`. Open the fixed file in IDA, Ghidra, or x64dbg directly.
