@@ -202,6 +202,177 @@ bool PEFixer::Fix(const std::string& dumpFile, const std::string& peFile,
         }
     }
 
+    // Restore the base relocation directory if zeroed.
+    // Loaders/analyzers may use the directory entry (not the section name) to
+    // locate .reloc; some games zero the directory pointer even when the
+    // section payload is intact.
+    {
+        auto& relocDir = dirs[IMAGE_DIRECTORY_ENTRY_BASERELOC];
+        if (relocDir.VirtualAddress == 0) {
+            for (const auto& sec : workingSections) {
+                if (strncmp(reinterpret_cast<const char*>(sec.Name), ".reloc", 6) == 0) {
+                    relocDir.VirtualAddress = sec.VirtualAddress;
+                    relocDir.Size           = sec.Misc.VirtualSize;
+                    std::cout << "[*] Restored .reloc base relocation directory from section table\n";
+                    break;
+                }
+            }
+        }
+    }
+
+    // --------------------------------------------------------
+    //  Strip directories that routinely cause IDA to hang or
+    //  spend forever in auto-analysis on dumped/protected PEs:
+    //    - LOAD_CONFIG:  protectors corrupt CFG/SEH counts so IDA
+    //      walks millions of phantom guard-CF call targets.
+    //    - BOUND_IMPORT: always stale on a runtime dump.
+    //    - DEBUG:        stale CodeView pointers can stall symbol load.
+    // --------------------------------------------------------
+    {
+        static constexpr int kStripDirs[] = {
+            IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG,
+            IMAGE_DIRECTORY_ENTRY_BOUND_IMPORT,
+            IMAGE_DIRECTORY_ENTRY_DEBUG,
+        };
+        for (int idx : kStripDirs) {
+            if (dirs[idx].VirtualAddress || dirs[idx].Size) {
+                std::cout << std::format("[*] Stripped directory entry {}\n", idx);
+                dirs[idx] = {};
+            }
+        }
+    }
+
+    // --------------------------------------------------------
+    //  Auto-strip CFG-flattened obfuscated pages.
+    //
+    //  Anti-tamper protectors used by AAA titles (e.g. Activision/COD)
+    //  wrap nearly every real instruction in an unconditional `JMP rel32`
+    //  to explode the basic-block graph and stall analyzers. The signature
+    //  is unmistakable: `0xE9` becomes the most common byte on the page,
+    //  reaching 12-15% density vs ~1% for normal x64 code.
+    //
+    //  When IDA tries to autoanalyze these pages — typically reached via
+    //  jump tables that point into them — it recurses through the JMP
+    //  maze, validating thousands of phantom basic blocks per function and
+    //  wedging the UI for hours. Overwriting these pages with `0xCC` int3
+    //  fill makes IDA's "is this code?" check fail at the first byte and
+    //  the analyzer abandons the target instead of recursing.
+    //
+    //  The 10% threshold is well above the noise floor: average E9 density
+    //  in clean code is ~1%, and even branch-heavy normal code rarely
+    //  exceeds 5%. A page above 10% is essentially always CFG-flattened.
+    //
+    //  Must run BEFORE the .pdata filter so the filter can drop entries
+    //  whose target page we just nuked — otherwise IDA creates one phantom
+    //  function per surviving entry and stalls in autoanalysis.
+    // --------------------------------------------------------
+    constexpr size_t kPageSize = 0x1000;
+    std::unordered_set<DWORD> strippedPageRvas;
+    {
+        constexpr size_t kE9Threshold = (kPageSize * 10) / 100; // 10% = 410 bytes
+
+        size_t totalStripped = 0;
+        for (const auto& sec : workingSections) {
+            if ((sec.Characteristics & IMAGE_SCN_MEM_EXECUTE) == 0) continue;
+
+            size_t       secStripped = 0;
+            const DWORD  secVAEnd    = sec.VirtualAddress + sec.Misc.VirtualSize;
+
+            for (DWORD rvaPage = sec.VirtualAddress;
+                 rvaPage + kPageSize <= secVAEnd;
+                 rvaPage += static_cast<DWORD>(kPageSize)) {
+                const size_t fileOff =
+                    static_cast<size_t>(sec.PointerToRawData) +
+                    static_cast<size_t>(rvaPage - sec.VirtualAddress);
+                if (fileOff + kPageSize > outBuf.size()) break;
+
+                size_t e9Count = 0;
+                for (size_t i = 0; i < kPageSize; ++i)
+                    if (outBuf[fileOff + i] == 0xE9) ++e9Count;
+
+                if (e9Count >= kE9Threshold) {
+                    memset(outBuf.data() + fileOff, 0xCC, kPageSize);
+                    strippedPageRvas.insert(rvaPage);
+                    ++secStripped;
+                }
+            }
+
+            if (secStripped > 0) {
+                char name[9] = {};
+                memcpy(name, sec.Name, 8);
+                std::cout << std::format("[*] Stripped {} obfuscated pages ({} KB) from {}\n",
+                                         secStripped, secStripped * 4, name);
+                totalStripped += secStripped;
+            }
+        }
+        if (totalStripped > 0) {
+            std::cout << std::format("[!] CFG-flattened anti-tamper detected — "
+                                     "auto-stripped {} pages ({} KB) total to 0xCC int3\n",
+                                     totalStripped, totalStripped * 4);
+        }
+    }
+
+    // --------------------------------------------------------
+    //  Filter .pdata. Drop RUNTIME_FUNCTION entries whose addresses
+    //  are zero, inverted, land outside an executable section, or point
+    //  into a page we just stripped to 0xCC.
+    //
+    //  The stripped-page check is what keeps IDA from creating a phantom
+    //  function for every entry into a CFG-flattened region: a
+    //  multi-million-line .pdata can survive the basic-validity filter
+    //  but every entry then resolves to int3 fill, making IDA's autoanalysis
+    //  spin for hours validating non-functions.
+    // --------------------------------------------------------
+    if (is64) {
+        auto& exDir = dirs[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+        if (exDir.VirtualAddress && exDir.Size >= sizeof(RUNTIME_FUNCTION)) {
+            auto rvaToRaw = [&](DWORD rva) -> size_t {
+                for (const auto& sec : workingSections) {
+                    if (rva >= sec.VirtualAddress &&
+                        rva <  sec.VirtualAddress + sec.SizeOfRawData)
+                        return static_cast<size_t>(sec.PointerToRawData) +
+                               (rva - sec.VirtualAddress);
+                }
+                return SIZE_MAX;
+            };
+
+            auto isExecRva = [&](DWORD rva) {
+                for (const auto& sec : workingSections) {
+                    if (rva >= sec.VirtualAddress &&
+                        rva <  sec.VirtualAddress + sec.Misc.VirtualSize)
+                        return (sec.Characteristics & IMAGE_SCN_MEM_EXECUTE) != 0;
+                }
+                return false;
+            };
+
+            auto isStrippedRva = [&](DWORD rva) {
+                return strippedPageRvas.contains(
+                    rva & ~static_cast<DWORD>(kPageSize - 1));
+            };
+
+            const size_t pdataRaw = rvaToRaw(exDir.VirtualAddress);
+            if (pdataRaw != SIZE_MAX && pdataRaw + exDir.Size <= outBuf.size()) {
+                auto* entries = reinterpret_cast<RUNTIME_FUNCTION*>(outBuf.data() + pdataRaw);
+                const size_t count = exDir.Size / sizeof(RUNTIME_FUNCTION);
+                size_t kept = 0;
+                size_t droppedStripped = 0;
+                for (size_t i = 0; i < count; ++i) {
+                    const auto& e = entries[i];
+                    if (e.BeginAddress == 0 && e.EndAddress == 0) continue;
+                    if (e.BeginAddress >= e.EndAddress) continue;
+                    if (!isExecRva(e.BeginAddress)) continue;
+                    if (isStrippedRva(e.BeginAddress)) { ++droppedStripped; continue; }
+                    entries[kept++] = e;
+                }
+                memset(entries + kept, 0, (count - kept) * sizeof(RUNTIME_FUNCTION));
+                exDir.Size = static_cast<DWORD>(kept * sizeof(RUNTIME_FUNCTION));
+                std::cout << std::format("[*] Filtered .pdata: kept {}/{} RUNTIME_FUNCTION entries"
+                                         " ({} dropped pointing into stripped pages)\n",
+                                         kept, count, droppedStripped);
+            }
+        }
+    }
+
     // --------------------------------------------------------
     //  Write output
     // --------------------------------------------------------

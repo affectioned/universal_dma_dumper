@@ -5,8 +5,11 @@
 
 // Walks a module's virtual address range one 4 KB page at a time,
 // skipping encrypted (0xCC) and uncommitted (0x00) pages and retrying
-// them on subsequent passes until 90% coverage is reached, the 15-minute
-// timeout expires, or Stop() is called.
+// them on subsequent passes until the dump stalls (no new page writes
+// for kStallTimeout), the 15-minute hard cap expires, or Stop() is
+// called. A page is "confirmed" only after two consecutive reads produce
+// identical content (double-read consistency); pages whose content keeps
+// changing are treated as still decrypting and refined on each pass.
 //
 // The output file is pre-allocated to the full module size and written
 // in-place, so page offsets match the module's virtual memory layout.
@@ -24,7 +27,9 @@ public:
     bool WasInterrupted() const { return !m_running; }
 
 private:
-    static constexpr size_t kPageSize = 0x1000;
+    static constexpr size_t kPageSize     = 0x1000;
+    static constexpr auto   kStallTimeout = std::chrono::seconds(90);
+    static constexpr auto   kHardTimeout  = std::chrono::minutes(15);
 
     VMM_HANDLE        m_hVMM;
     DWORD             m_pid;

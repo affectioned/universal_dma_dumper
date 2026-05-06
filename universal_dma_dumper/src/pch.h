@@ -21,6 +21,9 @@
 // std::unordered_set<ULONG64> dumpedPages;
 #include <unordered_set>
 
+// std::unordered_map<ULONG64, uint64_t> pendingHashes;
+#include <unordered_map>
+
 // const auto   startTime = std::chrono::steady_clock::now();
 #include <chrono>
 

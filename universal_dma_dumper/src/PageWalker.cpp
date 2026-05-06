@@ -23,6 +23,14 @@ void PageWalker::Preallocate() const {
     pre.write(reinterpret_cast<const char*>(zero.data()), m_imageSize);
 }
 
+// FNV-1a 64-bit. Used to fingerprint pages for double-read consistency without
+// keeping a 4 KB snapshot per pending page (8 bytes per page instead).
+static uint64_t HashPage(std::span<const uint8_t> buf) {
+    uint64_t h = 0xcbf29ce484222325ULL;
+    for (uint8_t b : buf) h = (h ^ b) * 0x100000001b3ULL;
+    return h;
+}
+
 void PageWalker::Run() {
     Preallocate();
 
@@ -32,13 +40,19 @@ void PageWalker::Run() {
         return;
     }
 
-    std::vector<uint8_t>        pageBuf(kPageSize);
-    std::unordered_set<ULONG64> dumpedPages;
+    std::vector<uint8_t>                  pageBuf(kPageSize);
+    std::unordered_set<ULONG64>           confirmedPages;   // two consistent reads, no longer retried
+    std::unordered_map<ULONG64, uint64_t> pendingHashes;    // hash of last successful read
 
     const size_t totalPages = (m_imageSize + kPageSize - 1) / kPageSize;
     const auto   startTime  = std::chrono::steady_clock::now();
+    auto         lastProgress = startTime;
 
-    std::cout << std::format("[*] Starting page walk — {} pages total\n", totalPages);
+    std::cout << std::format("[*] Starting page walk — {} pages total, "
+                             "{}s stall timeout, {}min hard cap\n",
+                             totalPages,
+                             std::chrono::duration_cast<std::chrono::seconds>(kStallTimeout).count(),
+                             std::chrono::duration_cast<std::chrono::minutes>(kHardTimeout).count());
 
     while (m_running) {
         // Check if END is currently held down
@@ -46,7 +60,7 @@ void PageWalker::Run() {
 
         for (ULONG64 addr = m_base; addr < m_base + m_imageSize; addr += kPageSize) {
             if (!m_running) break;
-            if (dumpedPages.contains(addr)) continue;
+            if (confirmedPages.contains(addr)) continue;
 
             // VMMDLL_FLAG_ZEROPAD_ON_FAIL: returns zeros for unreadable pages
             // rather than failing, so we can detect and retry them next pass.
@@ -59,30 +73,56 @@ void PageWalker::Run() {
             if (IsBlank(pageBuf) || IsEncrypted(pageBuf))
                 continue; // not yet executed or not yet decrypted — retry next pass
 
-            outf.seekp(static_cast<std::streamoff>(addr - m_base));
-            outf.write(reinterpret_cast<const char*>(pageBuf.data()), kPageSize);
-            dumpedPages.insert(addr);
+            const uint64_t h = HashPage(pageBuf);
+            auto it = pendingHashes.find(addr);
 
-            std::cout << std::format("  [p] 0x{:016X}  ({}/{})\n",
-                                     addr, dumpedPages.size(), totalPages);
+            if (it == pendingHashes.end()) {
+                // First successful read — write what we have so the file is never
+                // worse than "best-so-far", but don't confirm until a second read agrees.
+                outf.seekp(static_cast<std::streamoff>(addr - m_base));
+                outf.write(reinterpret_cast<const char*>(pageBuf.data()), kPageSize);
+                pendingHashes.emplace(addr, h);
+                lastProgress = std::chrono::steady_clock::now();
+            } else if (it->second == h) {
+                // Two consecutive identical reads — page is stable, accept it.
+                confirmedPages.insert(addr);
+                pendingHashes.erase(it);
+                lastProgress = std::chrono::steady_clock::now();
+                std::cout << std::format("  [p] 0x{:016X}  ({}/{})\n",
+                                         addr, confirmedPages.size(), totalPages);
+            } else {
+                // Content changed since last read — page is decrypting in place.
+                // Overwrite with the newer version and keep refining.
+                outf.seekp(static_cast<std::streamoff>(addr - m_base));
+                outf.write(reinterpret_cast<const char*>(pageBuf.data()), kPageSize);
+                it->second = h;
+                lastProgress = std::chrono::steady_clock::now();
+            }
         }
 
         // Flush once per pass rather than per page
         outf.flush();
 
-        const double coverage = static_cast<double>(dumpedPages.size()) /
-                                static_cast<double>(totalPages);
-
-        if (coverage >= 0.90) {
-            std::cout << std::format("[+] 90%% coverage reached — stopping walk "
-                                     "({} pages, {:.1f}%).\n",
-                                     dumpedPages.size(), coverage * 100.0);
+        const auto now = std::chrono::steady_clock::now();
+        if (now - lastProgress > kStallTimeout) {
+            const auto stallSecs = std::chrono::duration_cast<std::chrono::seconds>(
+                                       now - lastProgress).count();
+            const double coverage = static_cast<double>(confirmedPages.size()) /
+                                    static_cast<double>(totalPages);
+            std::cout << std::format("[!] Stalled — no new pages for {}s. "
+                                     "{} confirmed, {} pending ({:.1f}% confirmed).\n",
+                                     stallSecs, confirmedPages.size(),
+                                     pendingHashes.size(), coverage * 100.0);
             break;
         }
 
-        if (std::chrono::steady_clock::now() - startTime > std::chrono::minutes(15)) {
-            std::cout << std::format("[!] 15-minute timeout reached ({} pages, {:.1f}%).\n",
-                                     dumpedPages.size(), coverage * 100.0);
+        if (now - startTime > kHardTimeout) {
+            const double coverage = static_cast<double>(confirmedPages.size()) /
+                                    static_cast<double>(totalPages);
+            std::cout << std::format("[!] Hard timeout reached — {} confirmed, "
+                                     "{} pending ({:.1f}% confirmed).\n",
+                                     confirmedPages.size(), pendingHashes.size(),
+                                     coverage * 100.0);
             break;
         }
 
@@ -91,6 +131,7 @@ void PageWalker::Run() {
     }
 
     outf.close();
-    std::cout << std::format("[+] Page walk done — {} pages written to {}\n",
-                             dumpedPages.size(), m_outFile);
+    std::cout << std::format("[+] Page walk done — {} confirmed pages written to {} "
+                             "({} pending pages kept their best-so-far snapshot)\n",
+                             confirmedPages.size(), m_outFile, pendingHashes.size());
 }
