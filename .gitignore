@@ -44,3 +44,4 @@ ipch/
 dumps/
 *.bin
 *.dmp
+/.claude
