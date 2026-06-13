@@ -6,7 +6,58 @@
 // based off https://www.unknowncheats.me/forum/4595235-post1774.html
 // original logic credit goes to them
 
+// Streambuf that fans every write out to two underlying buffers — used to
+// mirror std::cout/std::cerr to both the console and a log file.
+class TeeStreambuf : public std::streambuf {
+public:
+    TeeStreambuf(std::streambuf* a, std::streambuf* b) : m_a(a), m_b(b) {}
+protected:
+    int overflow(int c) override {
+        if (c == EOF) return 0;
+        const auto ch = static_cast<char>(c);
+        const int  ra = m_a ? m_a->sputc(ch) : ch;
+        const int  rb = m_b ? m_b->sputc(ch) : ch;
+        return (ra == EOF || rb == EOF) ? EOF : c;
+    }
+    int sync() override {
+        const int ra = m_a ? m_a->pubsync() : 0;
+        const int rb = m_b ? m_b->pubsync() : 0;
+        return (ra == 0 && rb == 0) ? 0 : -1;
+    }
+private:
+    std::streambuf* m_a;
+    std::streambuf* m_b;
+};
+
 int main(int argc, char* argv[]) {
+    // --------------------------------------------------------
+    //  Open log file next to the running exe and tee cout/cerr to it
+    //  so the full session output is preserved after the console closes.
+    // --------------------------------------------------------
+    std::ofstream logFile;
+    {
+        char exePath[MAX_PATH] = {};
+        GetModuleFileNameA(nullptr, exePath, MAX_PATH);
+        std::filesystem::path logPath = std::filesystem::path(exePath).replace_extension(".log");
+        logFile.open(logPath, std::ios::out | std::ios::trunc);
+    }
+    TeeStreambuf coutTee(std::cout.rdbuf(), logFile.rdbuf());
+    TeeStreambuf cerrTee(std::cerr.rdbuf(), logFile.rdbuf());
+    std::streambuf* const origCout = std::cout.rdbuf(&coutTee);
+    std::streambuf* const origCerr = std::cerr.rdbuf(&cerrTee);
+    // Restore the original buffers before main() returns so the static
+    // stream destructors don't touch our stack-allocated tee buffers.
+    struct RestoreStreams {
+        std::streambuf* coutBuf;
+        std::streambuf* cerrBuf;
+        ~RestoreStreams() {
+            std::cout.flush();
+            std::cerr.flush();
+            std::cout.rdbuf(coutBuf);
+            std::cerr.rdbuf(cerrBuf);
+        }
+    } restoreStreams{ origCout, origCerr };
+
     std::cout << "=== Process Dumper (MemProcFS) ===\n";
 
     // --------------------------------------------------------

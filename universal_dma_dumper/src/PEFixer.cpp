@@ -220,6 +220,55 @@ bool PEFixer::Fix(const std::string& dumpFile, const std::string& peFile,
         }
     }
 
+    // Clear the .reloc directory if the payload is empty.
+    //
+    // IDA walks the relocation table sequentially: each block has an 8-byte
+    // header (VirtualAddress + SizeOfBlock) and a zero header terminates the
+    // walk. Anti-tamper protectors (Marathon's VMProtect build is the case
+    // that motivated this) commonly wipe .reloc after the loader applies
+    // relocations — the section payload is then all zeros but the directory
+    // still advertises it, so IDA chases the pointer into nothing and either
+    // disables relocation analysis silently or trips up plugins that assume
+    // a present directory means valid data.
+    //
+    // Detecting an entirely-zero header is enough: if the first block header
+    // is zero, IDA cannot walk past it regardless of what comes after, so
+    // clearing the directory is strictly more honest than leaving a dangling
+    // pointer.
+    {
+        auto& relocDir = dirs[IMAGE_DIRECTORY_ENTRY_BASERELOC];
+        if (relocDir.VirtualAddress && relocDir.Size) {
+            size_t relocRaw = SIZE_MAX;
+            for (const auto& sec : workingSections) {
+                if (relocDir.VirtualAddress >= sec.VirtualAddress &&
+                    relocDir.VirtualAddress <  sec.VirtualAddress + sec.SizeOfRawData) {
+                    relocRaw = static_cast<size_t>(sec.PointerToRawData) +
+                               (relocDir.VirtualAddress - sec.VirtualAddress);
+                    break;
+                }
+            }
+
+            // Scan the first page of the reloc payload. Catches both
+            // "entirely stripped" (the Marathon case) and "first block header
+            // zeroed" — IDA's walker stops dead on a zero header either way.
+            const size_t scanBytes = std::min<size_t>(relocDir.Size, 0x1000);
+            if (relocRaw != SIZE_MAX && relocRaw + scanBytes <= outBuf.size()) {
+                const bool headerZero = std::all_of(
+                    outBuf.data() + relocRaw,
+                    outBuf.data() + relocRaw + scanBytes,
+                    [](uint8_t b) { return b == 0; });
+
+                if (headerZero) {
+                    std::cout << std::format(
+                        "[*] Cleared .reloc directory — payload is zero "
+                        "({} KB stripped by protector, directory pointer dropped)\n",
+                        relocDir.Size / 1024);
+                    relocDir = {};
+                }
+            }
+        }
+    }
+
     // --------------------------------------------------------
     //  Strip directories that routinely cause IDA to hang or
     //  spend forever in auto-analysis on dumped/protected PEs:

@@ -11,6 +11,13 @@
 // identical content (double-read consistency); pages whose content keeps
 // changing are treated as still decrypting and refined on each pass.
 //
+// Iteration is restricted to pages the PTE map reports as committed in
+// the process, which skips entire uncommitted ranges (paged-out code,
+// reserved-but-uncommitted regions) that would otherwise burn DMA
+// bandwidth returning zeros every pass. Within the committed set, pages
+// that return all-zero kZeroEvictThreshold consecutive passes are evicted
+// from the rotation so the stall timer can fire when real progress stops.
+//
 // The output file is pre-allocated to the full module size and written
 // in-place, so page offsets match the module's virtual memory layout.
 class PageWalker {
@@ -27,9 +34,10 @@ public:
     bool WasInterrupted() const { return !m_running; }
 
 private:
-    static constexpr size_t kPageSize     = 0x1000;
-    static constexpr auto   kStallTimeout = std::chrono::seconds(90);
-    static constexpr auto   kHardTimeout  = std::chrono::minutes(15);
+    static constexpr size_t   kPageSize           = 0x1000;
+    static constexpr auto     kStallTimeout       = std::chrono::seconds(90);
+    static constexpr auto     kHardTimeout        = std::chrono::minutes(15);
+    static constexpr uint32_t kZeroEvictThreshold = 5;
 
     VMM_HANDLE        m_hVMM;
     DWORD             m_pid;
@@ -39,6 +47,11 @@ private:
     std::atomic<bool> m_running{ true };
 
     void Preallocate() const;
+
+    // Builds the list of page addresses within [m_base, m_base+m_imageSize)
+    // that the PTE map reports as committed. Returns an empty vector on
+    // failure; the caller should fall back to a linear walk in that case.
+    std::vector<ULONG64> BuildCommittedPageList() const;
 
     static bool IsEncrypted(std::span<const uint8_t> buf);
     static bool IsBlank(std::span<const uint8_t> buf);

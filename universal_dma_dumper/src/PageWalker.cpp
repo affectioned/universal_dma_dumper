@@ -23,6 +23,38 @@ void PageWalker::Preallocate() const {
     pre.write(reinterpret_cast<const char*>(zero.data()), m_imageSize);
 }
 
+std::vector<ULONG64> PageWalker::BuildCommittedPageList() const {
+    std::vector<ULONG64> pages;
+
+    PVMMDLL_MAP_PTE pteMap = nullptr;
+    if (!VMMDLL_Map_GetPteW(m_hVMM, m_pid, FALSE, &pteMap) || !pteMap)
+        return pages;
+
+    const ULONG64 rangeStart = m_base;
+    const ULONG64 rangeEnd   = m_base + m_imageSize;
+
+    // PTE map entries are sorted by vaBase. Each entry covers `cPages`
+    // contiguous 4 KB pages starting at vaBase. Enumerate every page that
+    // falls inside our module's VA range.
+    for (DWORD i = 0; i < pteMap->cMap; ++i) {
+        const auto& e = pteMap->pMap[i];
+        const ULONG64 entryStart = e.vaBase;
+        const ULONG64 entryEnd   = e.vaBase + e.cPages * kPageSize;
+
+        if (entryEnd <= rangeStart) continue;
+        if (entryStart >= rangeEnd) break;
+
+        const ULONG64 first = std::max(entryStart, rangeStart) & ~(kPageSize - 1);
+        const ULONG64 last  = std::min(entryEnd,   rangeEnd);
+
+        for (ULONG64 addr = first; addr < last; addr += kPageSize)
+            pages.push_back(addr);
+    }
+
+    VMMDLL_MemFree(pteMap);
+    return pages;
+}
+
 // FNV-1a 64-bit. Used to fingerprint pages for double-read consistency without
 // keeping a 4 KB snapshot per pending page (8 bytes per page instead).
 static uint64_t HashPage(std::span<const uint8_t> buf) {
@@ -43,24 +75,53 @@ void PageWalker::Run() {
     std::vector<uint8_t>                  pageBuf(kPageSize);
     std::unordered_set<ULONG64>           confirmedPages;   // two consistent reads, no longer retried
     std::unordered_map<ULONG64, uint64_t> pendingHashes;    // hash of last successful read
+    std::unordered_set<ULONG64>           evictedPages;     // returned all-zero too many times in a row
+    std::unordered_map<ULONG64, uint32_t> zeroReadCount;    // consecutive all-zero reads per page
 
-    const size_t totalPages = (m_imageSize + kPageSize - 1) / kPageSize;
-    const auto   startTime  = std::chrono::steady_clock::now();
-    auto         lastProgress = startTime;
+    // Query the process PTE map and walk only pages it reports as committed.
+    // For a heavily-protected ~1 GB module this typically excludes hundreds of
+    // thousands of paged-out / never-committed pages that the linear walk
+    // would otherwise re-read every pass.
+    std::vector<ULONG64> walkOrder = BuildCommittedPageList();
+    const bool usingPteMap = !walkOrder.empty();
+    if (!usingPteMap) {
+        const size_t total = (m_imageSize + kPageSize - 1) / kPageSize;
+        walkOrder.reserve(total);
+        for (ULONG64 addr = m_base; addr < m_base + m_imageSize; addr += kPageSize)
+            walkOrder.push_back(addr);
+    }
 
-    std::cout << std::format("[*] Starting page walk — {} pages total, "
-                             "{}s stall timeout, {}min hard cap\n",
-                             totalPages,
+    const size_t totalPages       = (m_imageSize + kPageSize - 1) / kPageSize;
+    const size_t candidatePages   = walkOrder.size();
+    const auto   startTime        = std::chrono::steady_clock::now();
+    auto         lastProgress     = startTime;
+
+    if (usingPteMap) {
+        std::cout << std::format("[*] PTE map: {} committed pages of {} total "
+                                 "({:.1f}% — skipping {} uncommitted)\n",
+                                 candidatePages, totalPages,
+                                 candidatePages * 100.0 / static_cast<double>(totalPages),
+                                 totalPages - candidatePages);
+    } else {
+        std::cout << "[~] PTE map unavailable — falling back to linear walk\n";
+    }
+
+    std::cout << std::format("[*] Starting page walk — {} candidate pages, "
+                             "{}s stall timeout, {}min hard cap, "
+                             "evict after {} consecutive zero reads\n",
+                             candidatePages,
                              std::chrono::duration_cast<std::chrono::seconds>(kStallTimeout).count(),
-                             std::chrono::duration_cast<std::chrono::minutes>(kHardTimeout).count());
+                             std::chrono::duration_cast<std::chrono::minutes>(kHardTimeout).count(),
+                             kZeroEvictThreshold);
 
     while (m_running) {
         // Check if END is currently held down
         if (GetAsyncKeyState(VK_END) & 0x8000) Stop();
 
-        for (ULONG64 addr = m_base; addr < m_base + m_imageSize; addr += kPageSize) {
+        for (ULONG64 addr : walkOrder) {
             if (!m_running) break;
             if (confirmedPages.contains(addr)) continue;
+            if (evictedPages.contains(addr))   continue;
 
             // VMMDLL_FLAG_ZEROPAD_ON_FAIL: returns zeros for unreadable pages
             // rather than failing, so we can detect and retry them next pass.
@@ -70,8 +131,22 @@ void PageWalker::Run() {
                                   VMMDLL_FLAG_ZEROPAD_ON_FAIL))
                 continue;
 
-            if (IsBlank(pageBuf) || IsEncrypted(pageBuf))
-                continue; // not yet executed or not yet decrypted — retry next pass
+            // All-zero reads are most often uncommitted pages or ZEROPAD'd
+            // failures. Encrypted pages (all 0xCC) might decrypt later, so
+            // they're retried indefinitely — but zero pages are evicted after
+            // kZeroEvictThreshold consecutive failures so they stop resetting
+            // the stall timer in BuildCommittedPageList's blind spots.
+            if (IsBlank(pageBuf)) {
+                if (++zeroReadCount[addr] >= kZeroEvictThreshold) {
+                    evictedPages.insert(addr);
+                    zeroReadCount.erase(addr);
+                }
+                continue;
+            }
+            if (IsEncrypted(pageBuf))
+                continue; // protector hasn't decrypted yet — keep retrying
+
+            zeroReadCount.erase(addr);
 
             const uint64_t h = HashPage(pageBuf);
             auto it = pendingHashes.find(addr);
@@ -108,21 +183,24 @@ void PageWalker::Run() {
             const auto stallSecs = std::chrono::duration_cast<std::chrono::seconds>(
                                        now - lastProgress).count();
             const double coverage = static_cast<double>(confirmedPages.size()) /
-                                    static_cast<double>(totalPages);
+                                    static_cast<double>(candidatePages);
             std::cout << std::format("[!] Stalled — no new pages for {}s. "
-                                     "{} confirmed, {} pending ({:.1f}% confirmed).\n",
+                                     "{} confirmed, {} pending, {} evicted "
+                                     "({:.1f}% of candidates confirmed).\n",
                                      stallSecs, confirmedPages.size(),
-                                     pendingHashes.size(), coverage * 100.0);
+                                     pendingHashes.size(), evictedPages.size(),
+                                     coverage * 100.0);
             break;
         }
 
         if (now - startTime > kHardTimeout) {
             const double coverage = static_cast<double>(confirmedPages.size()) /
-                                    static_cast<double>(totalPages);
+                                    static_cast<double>(candidatePages);
             std::cout << std::format("[!] Hard timeout reached — {} confirmed, "
-                                     "{} pending ({:.1f}% confirmed).\n",
+                                     "{} pending, {} evicted "
+                                     "({:.1f}% of candidates confirmed).\n",
                                      confirmedPages.size(), pendingHashes.size(),
-                                     coverage * 100.0);
+                                     evictedPages.size(), coverage * 100.0);
             break;
         }
 
@@ -132,6 +210,7 @@ void PageWalker::Run() {
 
     outf.close();
     std::cout << std::format("[+] Page walk done — {} confirmed pages written to {} "
-                             "({} pending pages kept their best-so-far snapshot)\n",
-                             confirmedPages.size(), m_outFile, pendingHashes.size());
+                             "({} pending kept best-so-far, {} unreadable pages evicted)\n",
+                             confirmedPages.size(), m_outFile,
+                             pendingHashes.size(), evictedPages.size());
 }
