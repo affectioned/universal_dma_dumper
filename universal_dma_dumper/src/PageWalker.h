@@ -2,6 +2,7 @@
 #include <string>
 #include <atomic>
 #include "..\libs\vmmdll.h"
+#include "Types.h"
 
 // Walks a module's virtual address range one 4 KB page at a time,
 // skipping encrypted (0xCC) and uncommitted (0x00) pages and retrying
@@ -20,10 +21,13 @@
 //
 // The output file is pre-allocated to the full module size and written
 // in-place, so page offsets match the module's virtual memory layout.
+// Executable sections in the prefill are written with 0x90 (NOP) rather
+// than 0x00 so any pages that never read back disassemble as benign
+// padding instead of `add [rax], al` (the int interpretation of 0x00).
 class PageWalker {
 public:
     PageWalker(VMM_HANDLE hVMM, DWORD pid, ULONG64 base, DWORD imageSize,
-               const std::string& outFile);
+               const std::string& outFile, const ModuleLayout& layout = {});
 
     // Blocks until the walk completes or is stopped.
     void Run();
@@ -44,6 +48,7 @@ private:
     ULONG64           m_base;
     DWORD             m_imageSize;
     std::string       m_outFile;
+    ModuleLayout      m_layout;
     std::atomic<bool> m_running{ true };
 
     void Preallocate() const;

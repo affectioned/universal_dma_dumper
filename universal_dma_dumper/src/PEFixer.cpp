@@ -1,8 +1,10 @@
 #include "pch.h"
 #include "PEFixer.h"
+#include "ImportRebuilder.h"
 
 bool PEFixer::Fix(const std::string& dumpFile, const std::string& peFile,
-                  const ModuleLayout& layout) {
+                  const ModuleLayout& layout,
+                  VMM_HANDLE hVMM, DWORD pid, ULONG64 modBase) {
     // --------------------------------------------------------
     //  Load memory dump
     // --------------------------------------------------------
@@ -421,6 +423,16 @@ bool PEFixer::Fix(const std::string& dumpFile, const std::string& peFile,
             }
         }
     }
+
+    // --------------------------------------------------------
+    //  Rebuild IMPORT / IAT directories from the live process.
+    //
+    //  Runs after .pdata filtering so the new section's RVAs can't
+    //  accidentally collide with anything the filter just trimmed, and
+    //  after CFG-flatten stripping so the displacement patcher doesn't
+    //  waste cycles scanning solid-0xCC pages.
+    // --------------------------------------------------------
+    ImportRebuilder::Rebuild(outBuf, workingSections, hVMM, pid, modBase);
 
     // --------------------------------------------------------
     //  Write output

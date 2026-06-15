@@ -1,5 +1,6 @@
 #pragma once
 #include <string>
+#include "..\libs\vmmdll.h"
 #include "Types.h"
 
 // Converts a raw memory-layout dump into a proper file-layout PE.
@@ -12,8 +13,13 @@
 // When valid, the section table and data directories from MemProcFS are used instead
 // of whatever is in the dump's virtual memory — recovering correct structure even
 // when the game has zeroed or corrupted its own in-memory PE headers.
+//
+// When hVMM/pid/modBase are supplied, ImportRebuilder is invoked after the PE
+// layout is reconstructed to rebuild IMPORT/IAT directories from the process's
+// other loaded modules and patch call/jmp displacements through the new IAT.
 class PEFixer {
 public:
     static bool Fix(const std::string& dumpFile, const std::string& peFile,
-                    const ModuleLayout& layout = {});
+                    const ModuleLayout& layout = {},
+                    VMM_HANDLE hVMM = nullptr, DWORD pid = 0, ULONG64 modBase = 0);
 };

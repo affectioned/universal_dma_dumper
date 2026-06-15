@@ -2,8 +2,9 @@
 #include "PageWalker.h"
 
 PageWalker::PageWalker(VMM_HANDLE hVMM, DWORD pid, ULONG64 base, DWORD imageSize,
-                       const std::string& outFile)
-    : m_hVMM(hVMM), m_pid(pid), m_base(base), m_imageSize(imageSize), m_outFile(outFile) {}
+                       const std::string& outFile, const ModuleLayout& layout)
+    : m_hVMM(hVMM), m_pid(pid), m_base(base), m_imageSize(imageSize),
+      m_outFile(outFile), m_layout(layout) {}
 
 void PageWalker::Stop() {
     m_running = false;
@@ -18,9 +19,29 @@ bool PageWalker::IsBlank(std::span<const uint8_t> buf) {
 }
 
 void PageWalker::Preallocate() const {
+    // Default to 0x00 fill, then overwrite executable section ranges with 0x90.
+    // Holes left in code sections after the walk then look like NOP padding
+    // rather than `add [rax], al`, which IDA otherwise interprets as code.
+    std::vector<uint8_t> buf(m_imageSize, 0x00);
+
+    if (m_layout.valid) {
+        size_t execBytes = 0;
+        for (const auto& sec : m_layout.sections) {
+            if ((sec.Characteristics & IMAGE_SCN_MEM_EXECUTE) == 0) continue;
+            const size_t off  = sec.VirtualAddress;
+            const size_t size = sec.Misc.VirtualSize;
+            if (off >= m_imageSize) continue;
+            const size_t end = std::min<size_t>(off + size, m_imageSize);
+            std::fill(buf.begin() + off, buf.begin() + end, 0x90);
+            execBytes += end - off;
+        }
+        if (execBytes)
+            std::cout << std::format("[*] Prefilled {} KB of executable sections with 0x90\n",
+                                     execBytes / 1024);
+    }
+
     std::ofstream pre(m_outFile, std::ios::binary | std::ios::trunc);
-    std::vector<uint8_t> zero(m_imageSize, 0);
-    pre.write(reinterpret_cast<const char*>(zero.data()), m_imageSize);
+    pre.write(reinterpret_cast<const char*>(buf.data()), m_imageSize);
 }
 
 std::vector<ULONG64> PageWalker::BuildCommittedPageList() const {

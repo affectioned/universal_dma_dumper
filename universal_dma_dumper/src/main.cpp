@@ -156,7 +156,7 @@ int main(int argc, char* argv[]) {
     //  Page walk
     // --------------------------------------------------------
     std::cout << "[*] Starting page walker...\n";
-    PageWalker walker(hVMM, pid, modBase, modSize, rawFile);
+    PageWalker walker(hVMM, pid, modBase, modSize, rawFile, layout);
     walker.Run();
 
     if (walker.WasInterrupted())
@@ -166,7 +166,7 @@ int main(int argc, char* argv[]) {
     //  Fix PE layout
     // --------------------------------------------------------
     std::cout << "\n[*] Fixing PE layout...\n";
-    if (!PEFixer::Fix(rawFile, fixedFile, layout)) {
+    if (!PEFixer::Fix(rawFile, fixedFile, layout, hVMM, pid, modBase)) {
         std::cerr << std::format("[!] FixPE failed — raw dump is still at: {}\n", rawFile);
         VMMDLL_Close(hVMM);
         return 1;
