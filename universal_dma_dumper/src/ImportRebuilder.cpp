@@ -142,7 +142,12 @@ bool ImportRebuilder::Rebuild(std::vector<uint8_t>& outBuf,
     if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
     if (static_cast<size_t>(dos->e_lfanew) + sizeof(IMAGE_NT_HEADERS64) > outBuf.size()) return false;
 
-    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(outBuf.data() + dos->e_lfanew);
+    // Cache e_lfanew as a value — outBuf gets resized below, which reallocates
+    // (large outBufs are backed by VirtualAlloc, whose pages are decommitted on
+    // free), so any pointer into the old storage would fault when dereferenced.
+    const DWORD e_lfanew = dos->e_lfanew;
+
+    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(outBuf.data() + e_lfanew);
     if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
     if (nt->FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64) {
         std::cout << "[~] Import rebuild skipped (x86 PEs not supported)\n";
@@ -208,7 +213,7 @@ bool ImportRebuilder::Rebuild(std::vector<uint8_t>& outBuf,
     const uint32_t newRaw = static_cast<uint32_t>(alignUp(static_cast<uint32_t>(outBuf.size()), fileAlignment));
 
     // Make sure we have room in the header for one more section table entry.
-    const size_t sectionTableOffset = static_cast<size_t>(dos->e_lfanew) + sizeof(IMAGE_NT_HEADERS64);
+    const size_t sectionTableOffset = static_cast<size_t>(e_lfanew) + sizeof(IMAGE_NT_HEADERS64);
     const size_t neededHeaderEnd    = sectionTableOffset + (workingSections.size() + 1) * sizeof(IMAGE_SECTION_HEADER);
     if (neededHeaderEnd > nt->OptionalHeader.SizeOfHeaders) {
         std::cout << "[~] Import rebuild skipped (SizeOfHeaders has no room for a new section)\n";
@@ -217,8 +222,14 @@ bool ImportRebuilder::Rebuild(std::vector<uint8_t>& outBuf,
 
     // ----------------------------------------------------------------
     //  Grow outBuf and lay out the new section.
+    //
+    //  The resize almost always reallocates (outBuf was constructed at exact
+    //  capacity in PEFixer). For large dumps the old backing store is decommitted
+    //  on free, so `dos`/`nt` become dangling here — refresh them below.
     // ----------------------------------------------------------------
     outBuf.resize(static_cast<size_t>(newRaw) + rawAlign, 0);
+    dos  = reinterpret_cast<IMAGE_DOS_HEADER*>(outBuf.data());
+    nt   = reinterpret_cast<IMAGE_NT_HEADERS64*>(outBuf.data() + e_lfanew);
     uint8_t* base = outBuf.data() + newRaw;
 
     const uint32_t iatRva  = newVA;
@@ -297,7 +308,6 @@ bool ImportRebuilder::Rebuild(std::vector<uint8_t>& outBuf,
                 &newSec, sizeof(newSec));
     workingSections.push_back(newSec);
 
-    nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(outBuf.data() + dos->e_lfanew);
     nt->FileHeader.NumberOfSections = static_cast<WORD>(workingSections.size());
     nt->OptionalHeader.SizeOfImage += virtAlign;
 
