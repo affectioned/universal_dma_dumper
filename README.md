@@ -62,14 +62,6 @@ MemProcFS exposes loaded kernel drivers as modules of the `System` process (PID 
 universal_dma_dumper.exe -name System -module ntoskrnl.exe
 universal_dma_dumper.exe -name System -module EasyAntiCheat_EOSSys.sys
 ```
-
-Everything downstream (page walk, section-table repair, `.pdata` restore, import rebuild against ntoskrnl/hal) works uniformly on kernel VAs — the walker and PEFixer make no user-mode assumptions.
-
-**Caveats:**
-- Drivers loaded in the secure kernel (VTL1 / VBS / HVCI-isolated) sit behind the IOMMU and are unreachable even over DMA. If a dump comes back all zeros on something that's clearly running, that's why. Normal kernel drivers live in VTL0 and are fine.
-- Paged-out sections (large paged-pool working sets) will be classified as uncommitted and skipped. Expect a lower valid-page ratio than a user-mode DLL.
-- The secure kernel itself (`securekernel.exe`) and SMM code are out of scope.
-
 ---
 
 ## How it works
