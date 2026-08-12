@@ -54,6 +54,22 @@ universal_dma_dumper.exe -name <ProcessName> -out <dir>
 
 Press **END** to stop the dump early. The PE fix will still run on whatever was collected.
 
+### Dumping kernel drivers
+
+MemProcFS exposes loaded kernel drivers as modules of the `System` process (PID 4), so the same pipeline works — point `-name` at `System` and `-module` at the driver's filename:
+
+```
+universal_dma_dumper.exe -name System -module ntoskrnl.exe
+universal_dma_dumper.exe -name System -module EasyAntiCheat_EOSSys.sys
+```
+
+Everything downstream (page walk, section-table repair, `.pdata` restore, import rebuild against ntoskrnl/hal) works uniformly on kernel VAs — the walker and PEFixer make no user-mode assumptions.
+
+**Caveats:**
+- Drivers loaded in the secure kernel (VTL1 / VBS / HVCI-isolated) sit behind the IOMMU and are unreachable even over DMA. If a dump comes back all zeros on something that's clearly running, that's why. Normal kernel drivers live in VTL0 and are fine.
+- Paged-out sections (large paged-pool working sets) will be classified as uncommitted and skipped. Expect a lower valid-page ratio than a user-mode DLL.
+- The secure kernel itself (`securekernel.exe`) and SMM code are out of scope.
+
 ---
 
 ## How it works
@@ -111,9 +127,9 @@ The fix step rebuilds a proper file-layout PE and additionally strips/repairs se
 ```
 dumps/
 ├── <ModuleName>_raw.bin      # raw memory-layout dump
-└── <ModuleName>_fixed.exe    # reconstructed file-layout PE  (or _fixed.dll for DLL modules)
+└── <ModuleName>_fixed.exe    # reconstructed file-layout PE  (or _fixed.dll / _fixed.sys)
 
 <exe-dir>/universal_dma_dumper.log    # full session output, mirrored from std::cout / std::cerr
 ```
 
-The output extension is preserved from the module name — dumping `engine.dll` produces `engine_fixed.dll`. Open the fixed file in IDA, Ghidra, or x64dbg directly.
+The output extension is preserved from the module name — `engine.dll` → `engine_fixed.dll`, `driver.sys` → `driver_fixed.sys`, otherwise `_fixed.exe`. Open the fixed file in IDA, Ghidra, or x64dbg directly.

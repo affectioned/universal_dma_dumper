@@ -145,7 +145,7 @@ int main(int argc, char* argv[]) {
     if (const size_t dot = baseName.rfind('.'); dot != std::string::npos) {
         std::string ext = baseName.substr(dot);
         std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
-        if (ext == ".dll") fixedExt = ".dll";
+        if (ext == ".dll" || ext == ".sys") fixedExt = ext;
         baseName = baseName.substr(0, dot);
     }
 
