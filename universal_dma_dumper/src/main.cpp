@@ -61,17 +61,38 @@ int main(int argc, char* argv[]) {
     std::cout << "=== Process Dumper (MemProcFS) ===\n";
 
     // --------------------------------------------------------
-    //  Parse -name (required)
+    //  Parse listing flags (mutually exclusive with each other, and
+    //  short-circuit the dump path when set).
     // --------------------------------------------------------
-    auto it = std::find(argv + 1, argv + argc, std::string_view("-name"));
-    if (it == argv + argc || std::next(it) == argv + argc) {
-        std::cout << "Usage:\n"
-            << "  dumper.exe -name <ProcessName>\n"
-            << "  dumper.exe -name <ProcessName> -module <ModuleName>\n"
-            << "  dumper.exe -name <ProcessName> -module <ModuleName> -out <dir>\n";
+    const bool listDrivers = std::find(argv + 1, argv + argc, std::string_view("-list-drivers")) != argv + argc;
+    const bool listModules = std::find(argv + 1, argv + argc, std::string_view("-list-modules")) != argv + argc;
+    if (listDrivers && listModules) {
+        std::cerr << "[!] -list-drivers and -list-modules are mutually exclusive.\n";
         return 1;
     }
-    const std::string nameArg = *std::next(it);
+
+    // --------------------------------------------------------
+    //  Parse -name. Required for dump / -list-modules; defaults to "System"
+    //  for -list-drivers since kernel drivers live under PID 4.
+    // --------------------------------------------------------
+    std::string nameArg;
+    {
+        auto it = std::find(argv + 1, argv + argc, std::string_view("-name"));
+        if (it != argv + argc && std::next(it) != argv + argc) {
+            nameArg = *std::next(it);
+        } else if (listDrivers) {
+            nameArg = "System";
+        } else {
+            std::cout << "Usage:\n"
+                << "  dumper.exe -name <ProcessName>\n"
+                << "  dumper.exe -name <ProcessName> -module <ModuleName>\n"
+                << "  dumper.exe -name <ProcessName> -module <ModuleName> -out <dir>\n"
+                << "  dumper.exe -list-drivers                     (enumerate PID 4 modules)\n"
+                << "  dumper.exe -name <ProcessName> -list-modules (enumerate a process's modules)\n";
+            return 1;
+        }
+    }
+    auto it = argv + argc;  // sentinel — reused by subsequent optional-arg lookups below
 
     // --------------------------------------------------------
     //  Parse -module (optional, defaults to process name)
@@ -108,6 +129,19 @@ int main(int argc, char* argv[]) {
     if (pid == 0) {
         VMMDLL_Close(hVMM);
         return 1;
+    }
+
+    // --------------------------------------------------------
+    //  Listing mode: enumerate modules and exit before the dump path.
+    //  -list-drivers walks PID 4 (kernel), -list-modules walks any PID.
+    // --------------------------------------------------------
+    if (listDrivers || listModules) {
+        Process::ListModules(hVMM, pid);
+        if (listModules)
+            std::cout << "[~] Note: manually-mapped modules that unlink from the PEB\n"
+                         "         will not appear here.\n";
+        VMMDLL_Close(hVMM);
+        return 0;
     }
 
     // --------------------------------------------------------

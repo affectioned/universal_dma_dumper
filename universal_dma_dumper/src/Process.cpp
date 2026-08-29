@@ -30,6 +30,95 @@ bool Process::GetModuleInfo(VMM_HANDLE hVMM, DWORD pid, const std::string& modul
     return true;
 }
 
+namespace {
+    // UTF-16 wchar_t* -> UTF-8 std::string. Returns empty on null/failure.
+    std::string wtou8(const wchar_t* w) {
+        if (!w || !*w) return {};
+        const int len = WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
+        if (len <= 1) return {};
+        std::string out(static_cast<size_t>(len) - 1, '\0');
+        WideCharToMultiByte(CP_UTF8, 0, w, -1, out.data(), len, nullptr, nullptr);
+        return out;
+    }
+
+    // Truncate a UTF-8 string to `width` display columns (naive: byte count).
+    // Good enough for the ASCII-heavy CompanyName / path strings we render.
+    std::string clip(std::string s, size_t width) {
+        if (s.size() > width) {
+            s.resize(width);
+            if (width >= 3) s.replace(width - 3, 3, "...");
+        }
+        return s;
+    }
+}
+
+void Process::ListModules(VMM_HANDLE hVMM, DWORD pid) {
+    PVMMDLL_MAP_MODULE pMap = nullptr;
+    if (!VMMDLL_Map_GetModuleW(hVMM, pid, &pMap, VMMDLL_MODULE_FLAG_VERSIONINFO)) {
+        std::cerr << "[!] ListModules: VMMDLL_Map_GetModuleW failed\n";
+        return;
+    }
+
+    struct Row {
+        ULONG64 vaBase;
+        DWORD   cbImageSize;
+        DWORD   cIAT;
+        std::string name;
+        std::string company;
+        std::string fullName;
+    };
+    std::vector<Row> rows;
+    rows.reserve(pMap->cMap);
+    for (DWORD i = 0; i < pMap->cMap; ++i) {
+        const auto& e = pMap->pMap[i];
+        Row r{
+            .vaBase       = e.vaBase,
+            .cbImageSize  = e.cbImageSize,
+            .cIAT         = e.cIAT,
+            .name         = wtou8(e.wszText),
+            .company      = e.pExVersionInfo ? wtou8(e.pExVersionInfo->wszCompanyName) : std::string{},
+            .fullName     = wtou8(e.wszFullName),
+        };
+        rows.push_back(std::move(r));
+    }
+    VMMDLL_MemFree(pMap);
+
+    // Alphabetical by name (case-insensitive, ASCII-only fold — good enough for module names).
+    std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) {
+        return std::lexicographical_compare(
+            a.name.begin(), a.name.end(),
+            b.name.begin(), b.name.end(),
+            [](char x, char y) {
+                return std::tolower(static_cast<unsigned char>(x)) <
+                       std::tolower(static_cast<unsigned char>(y));
+            });
+    });
+
+    // ------------------- render -------------------
+    constexpr size_t kNameCol    = 40;
+    constexpr size_t kCompanyCol = 34;
+    constexpr size_t kPathCol    = 60;
+
+    std::cout << std::format("\n[+] {} modules in PID {}:\n\n", rows.size(), pid);
+    std::cout << std::format("  {:<18}  {:>9}  {:>5}  {:<{}}  {:<{}}  {}\n",
+                             "BASE", "SIZE", "IAT",
+                             "NAME",    kNameCol,
+                             "COMPANY", kCompanyCol,
+                             "PATH");
+    std::cout << "  " << std::string(18 + 2 + 9 + 2 + 5 + 2 + kNameCol + 2 + kCompanyCol + 2 + kPathCol, '-') << '\n';
+
+    for (const auto& r : rows) {
+        std::cout << std::format("  0x{:016X}  {:>9}  {:>5}  {:<{}}  {:<{}}  {}\n",
+                                 r.vaBase,
+                                 std::format("0x{:07X}", r.cbImageSize),
+                                 r.cIAT,
+                                 clip(r.name,    kNameCol),    kNameCol,
+                                 clip(r.company, kCompanyCol), kCompanyCol,
+                                 clip(r.fullName, kPathCol));
+    }
+    std::cout << '\n';
+}
+
 ModuleLayout Process::GetModuleLayout(VMM_HANDLE hVMM, DWORD pid, const std::string& moduleName) {
     ModuleLayout layout;
 

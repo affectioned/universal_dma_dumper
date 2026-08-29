@@ -18,4 +18,10 @@ public:
     // independently of the process's live virtual memory, so it remains valid
     // even when the game has zeroed or corrupted its own in-memory PE headers.
     static ModuleLayout GetModuleLayout(VMM_HANDLE hVMM, DWORD pid, const std::string& moduleName);
+
+    // Enumerates every module loaded in the target PID (kernel drivers when
+    // pid == 4) with VERSIONINFO enrichment and prints a neutral table sorted
+    // alphabetically by name. Manually-mapped modules that unlink from the
+    // PEB / PsLoadedModuleList are invisible to this enumeration by design.
+    static void ListModules(VMM_HANDLE hVMM, DWORD pid);
 };

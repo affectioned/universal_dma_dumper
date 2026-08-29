@@ -17,42 +17,31 @@ Original page walker logic by [zarboz on UnknownCheats](https://www.unknowncheat
 
 ---
 
-## Project structure
-
-```
-universal_dma_dumper/
-├── libs/
-│   ├── leechcore.lib
-│   ├── leechcore.h
-│   ├── vmm.lib
-│   └── vmmdll.h
-├── src/
-│   ├── main.cpp
-│   ├── Types.h
-│   ├── Process.h / Process.cpp
-│   ├── PageWalker.h / PageWalker.cpp
-│   ├── PEFixer.h / PEFixer.cpp
-│   ├── pch.h / pch.cpp
-└── README.md
-```
-
----
-
 ## Usage
 
 ```
 universal_dma_dumper.exe -name <ProcessName>
 universal_dma_dumper.exe -name <ProcessName> -module <ModuleName.dll>
 universal_dma_dumper.exe -name <ProcessName> -out <dir>
+universal_dma_dumper.exe -list-drivers
+universal_dma_dumper.exe -name <ProcessName> -list-modules
 ```
 
 | Argument | Description |
 |---|---|
-| `-name` | Target process name (e.g. `game.exe`) — required |
-| `-module` | Specific module to dump within that process (e.g. `engine.dll`). Defaults to the process executable itself |
+| `-name` | Target process name (e.g. `game.exe`) — required unless `-list-drivers` is used |
+| `-module` | Specific module to dump (e.g. `engine.dll`). Defaults to the process executable |
 | `-out` | Output directory. Defaults to `./dumps` |
+| `-list-drivers` | Enumerate every loaded kernel driver (PID 4) and exit. `-name` defaults to `System` |
+| `-list-modules` | Enumerate every module in the given process and exit. Requires `-name` |
 
 Press **END** to stop the dump early. The PE fix will still run on whatever was collected.
+
+### Listing modules
+
+`-list-drivers` and `-list-modules` print a table (base, size, IAT count, name, company, path) sorted by name — useful when you know a target is loaded but don't know its exact filename (kernel driver names sometimes rotate per install; usermode loaders sometimes hide behind generic filenames).
+
+> Manually-mapped modules that unlink from the PEB / `PsLoadedModuleList` do **not** appear here — MemProcFS walks the same lists the loader maintains, so anything that erases its own entry is invisible by design. Finding those requires a VAD scan for anomalous RX regions, which this tool does not currently do.
 
 ### Dumping kernel drivers
 
@@ -62,55 +51,47 @@ MemProcFS exposes loaded kernel drivers as modules of the `System` process (PID 
 universal_dma_dumper.exe -name System -module ntoskrnl.exe
 universal_dma_dumper.exe -name System -module EasyAntiCheat_EOSSys.sys
 ```
+
 ---
 
 ## How it works
 
 ### 1. Page walker
 
-Some games encrypt their code pages at rest and decrypt them on demand at runtime — this is done by the developers themselves, not anti-cheat. Pages may start as all `0x00` (uncommitted, not yet executed) and become readable only as the game executes them during normal gameplay.
+Some games encrypt their code pages at rest and decrypt them on demand at runtime — done by the developers, not anti-cheat. A naive single-shot read captures a mix of real code and encrypted or uncommitted pages, making the dump largely useless.
 
-A naive single-shot read of the entire module will capture a mix of real code and encrypted or uncommitted pages, making the dump largely useless.
+The page walker reads the module one 4 KB page at a time in a continuous retry loop:
 
-The page walker solves this by reading the module one 4KB page at a time in a continuous retry loop:
+1. **PTE-map filter.** `VMMDLL_Map_GetPteW` enumerates every committed page in the module's VA range; the walk iterates only those instead of the whole image, eliminating hundreds of thousands of uncommitted pages on large protected modules. Falls back to a linear walk if unavailable.
+2. The output file is pre-allocated to the full module size and zero-filled, so pages can be written in-place at their correct offsets.
+3. Each page is read with `VMMDLL_MemReadEx` + `VMMDLL_FLAG_ZEROPAD_ON_FAIL`, returning zeros for unreadable pages instead of failing.
+4. All-`0x00` (uncommitted) and all-`0xCC` (encrypted) pages are skipped and retried next pass. A page that reads zeros five consecutive passes is dropped from the rotation so the stall timer can fire on real inactivity; `0xCC` pages are retried indefinitely.
+5. Candidate pages are FNV-1a fingerprinted and read **twice** — the first non-trivial read is written immediately so the file is always "best-so-far", and the page is only marked *confirmed* once two consecutive reads match. Pages whose content keeps changing are treated as still-decrypting and refined each pass.
+6. Accepted pages are written at `offset = pageAddress - moduleBase`.
 
-1. **PTE-map filter.** Before the walk starts, `VMMDLL_Map_GetPteW` is queried to enumerate every page the kernel reports as committed within the module's VA range. The walk iterates only those pages instead of blindly scanning the whole image — on a ~1 GB protected module this typically eliminates hundreds of thousands of uncommitted pages (paged-out cold code, reserved-but-uncommitted regions) that would otherwise burn DMA bandwidth returning zeros every pass. Falls back to a linear walk if the PTE map is unavailable.
-2. The output file is pre-allocated to the full module size, filled with zeros, so pages can be written in-place at their correct offsets as they become available.
-3. For each page, `VMMDLL_MemReadEx` is called with `VMMDLL_FLAG_ZEROPAD_ON_FAIL` — this returns zeros for unreadable pages rather than failing, so they can be detected and skipped.
-4. Pages that are all `0x00` (uncommitted) or all `0xCC` (encrypted) are skipped and retried next pass. **Zero-read eviction:** a page that reads all zeros five consecutive passes is dropped from the rotation, so the stall timer can fire when real progress stops instead of looping forever on pages that will never have data. Encrypted (`0xCC`) pages are retried indefinitely since the protector may decrypt them later.
-5. A candidate page is fingerprinted with FNV-1a and read **twice** — the first non-trivial read is written immediately so the file is always "best-so-far", and the page is only marked *confirmed* (and stops being retried) once two consecutive reads produce identical content. Pages whose content keeps changing are treated as still-decrypting and refined on each pass.
-6. Accepted pages are written into the output file at `offset = pageAddress - moduleBase`.
-
-**Termination** happens when any of the following is met: the dump **stalls** (no page writes for 90 seconds), the **15-minute hard cap** expires, or **END** is pressed. The stall check counts any page write as progress — a first-read insert, a refined-write on hash change, or a confirmation. Once nothing moves forward for 90 seconds the walk exits; the hard cap exists only as a safety ceiling.
+**Termination:** the walk stops when it stalls (no page writes for 90 s), the 15-minute hard cap expires, or **END** is pressed.
 
 > For games where pages decrypt only during active gameplay (e.g. in-match but not in menus), run the tool while actively playing to maximise coverage.
 
-The result is a raw `.bin` file containing the module in its virtual memory layout, plus a `universal_dma_dumper.log` next to the exe with the full session output.
+The result is a raw `.bin` file containing the module in its virtual memory layout, plus a `universal_dma_dumper.log` next to the exe.
 
 ---
 
 ### 2. PE reconstruction (`_raw.bin` → `_fixed.exe`)
 
-The raw dump cannot be opened directly in IDA because it is in **memory layout**, not **file layout**.
+The raw dump cannot be opened directly in IDA because it is in **memory layout** (section data at `VirtualAddress` / RVA), not **file layout** (section data at `PointerToRawData`). The fix step rebuilds a proper file-layout PE and repairs several things that routinely break analyzers on protected dumps:
 
-| | Memory layout | File layout |
-|---|---|---|
-| Section data location | `VirtualAddress` (RVA) | `PointerToRawData` (file offset) |
-| How Windows uses it | Loaded PE mapped into process | PE on disk |
+**Header source** — Protectors zero the in-memory section table and data directories at runtime to defeat memory dumpers. The tool pulls this data from MemProcFS's internal module cache (`VMMDLL_ProcessGetSections`, `VMMDLL_ProcessGetDirectories`), populated at attach time and independent of the process's live memory — so it remains valid after the game has wiped its own headers. No disk access to the game's files is required; this works over DMA from a second PC. Machine type falls back to the `fWoW64` flag when the in-memory `FileHeader.Machine` is zeroed.
 
-The fix step rebuilds a proper file-layout PE and additionally strips/repairs several things that routinely break analyzers on protected dumps:
-
-**Header source** — Some protectors zero the in-memory section table and data directories at runtime to defeat memory dumpers. The tool queries MemProcFS's internal module database (`VMMDLL_ProcessGetSections`, `VMMDLL_ProcessGetDirectories`) before the walk begins. MemProcFS caches this data at attach time, independently of the process's live virtual memory, so it remains valid even after the game has wiped its own headers. No access to the game's files on disk is required — this works correctly when running on a second PC over DMA. Machine type falls back to the `fWoW64` flag when the in-memory `FileHeader.Machine` is zeroed.
-
-**Layout recalculation** — `PointerToRawData` and `SizeOfRawData` are recalculated from scratch using `VirtualSize` and `FileAlignment` rather than trusting the values in the headers, which protectors also corrupt.
+**Layout recalculation** — `PointerToRawData` and `SizeOfRawData` are recalculated from `VirtualSize` and `FileAlignment` rather than trusting header values, which protectors also corrupt.
 
 **Data directories**
-- **Security** (authenticode) directory is zeroed since the signature is invalid after reconstruction.
-- **Exception** (`.pdata`) directory is restored from the section table if missing — IDA uses this for x64 function boundary detection — and entries are filtered to drop zero/inverted addresses, entries pointing outside executable sections, and entries pointing into pages that were stripped to int3 fill (see below).
-- **Base relocation** directory is restored from the section table if missing. If the `.reloc` payload is actually all zeros (anti-tamper protectors commonly wipe it after the loader applies relocations), the directory entry is cleared entirely so IDA's relocation pass becomes a clean no-op instead of dereferencing a dangling pointer.
-- **LOAD_CONFIG**, **BOUND_IMPORT**, and **DEBUG** directories are stripped — protectors corrupt CFG/SEH counts so IDA walks millions of phantom guard-CF call targets; bound imports are always stale on a runtime dump; stale CodeView pointers can stall symbol load.
+- **Security** — zeroed (authenticode is invalid after reconstruction).
+- **Exception** (`.pdata`) — restored from the section table if missing; entries with zero/inverted addresses, addresses outside executable sections, or pointers into int3-stripped pages (see below) are dropped.
+- **Base relocation** — restored from the section table if missing. If the `.reloc` payload is all zeros (protectors commonly wipe it post-load), the directory entry is cleared so IDA's relocation pass becomes a no-op instead of dereferencing a dangling pointer.
+- **LOAD_CONFIG**, **BOUND_IMPORT**, **DEBUG** — stripped. Corrupted CFG/SEH counts make IDA walk millions of phantom guard-CF targets; bound imports are always stale on a runtime dump; stale CodeView pointers stall symbol load.
 
-**CFG-flattened anti-tamper auto-strip** — Anti-tamper protectors (typical of Activision/COD titles) wrap real instructions in chains of `JMP rel32` (`0xE9 ..`) to explode the basic-block graph and stall analyzers. Clean x64 code averages ~1% E9 density; CFG-flattened pages reach 12-15%. Every executable section is scanned page by page, and any 4 KB page with ≥10% `0xE9` density is overwritten with `0xCC` int3 fill so IDA's "is this code?" check fails at the first byte and the analyzer abandons the target instead of recursing. Without this, IDA autoanalysis can wedge for hours on a heavily-protected binary. The unmodified `_raw.bin` is always available to fall back on.
+**CFG-flattened anti-tamper auto-strip** — Anti-tamper protectors (typical of Activision/COD titles) wrap real instructions in chains of `JMP rel32` (`0xE9 ..`) to explode the basic-block graph. Clean x64 code averages ~1% E9 density; CFG-flattened pages reach 12-15%. Every executable page with ≥10% `0xE9` density is overwritten with `0xCC` int3 fill so IDA's code check fails at the first byte and the analyzer abandons the target instead of wedging for hours. The unmodified `_raw.bin` is always available to fall back on.
 
 ---
 
@@ -121,7 +102,7 @@ dumps/
 ├── <ModuleName>_raw.bin      # raw memory-layout dump
 └── <ModuleName>_fixed.exe    # reconstructed file-layout PE  (or _fixed.dll / _fixed.sys)
 
-<exe-dir>/universal_dma_dumper.log    # full session output, mirrored from std::cout / std::cerr
+<exe-dir>/universal_dma_dumper.log    # full session output
 ```
 
 The output extension is preserved from the module name — `engine.dll` → `engine_fixed.dll`, `driver.sys` → `driver_fixed.sys`, otherwise `_fixed.exe`. Open the fixed file in IDA, Ghidra, or x64dbg directly.
