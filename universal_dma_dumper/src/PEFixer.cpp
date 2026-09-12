@@ -364,6 +364,69 @@ bool PEFixer::Fix(const std::string& dumpFile, const std::string& peFile,
     }
 
     // --------------------------------------------------------
+    //  Replace unread NOP-prefilled pages with 0xCC.
+    //
+    //  The page walker pre-fills executable sections with 0x90
+    //  before the walk.  Pages that were never read from the
+    //  target remain as solid NOP.  A full 4 KB page of 0x90 is
+    //  essentially impossible in real compiled code (compilers
+    //  emit at most a few bytes of NOP alignment), so this is a
+    //  reliable indicator of "never read."
+    //
+    //  Converting to 0xCC makes IDA's is-this-code check fail
+    //  immediately, preventing hours of wasted auto-analysis on
+    //  phantom NOP sleds — particularly in packer artifact
+    //  sections (.upx etc.) where most pages are compressed data
+    //  that the prefill masks as fake code.
+    // --------------------------------------------------------
+    {
+        size_t totalNopCleaned = 0;
+        for (const auto& sec : workingSections) {
+            if ((sec.Characteristics & IMAGE_SCN_MEM_EXECUTE) == 0) continue;
+
+            size_t      secCleaned = 0;
+            const DWORD secVAEnd   = sec.VirtualAddress + sec.Misc.VirtualSize;
+
+            for (DWORD rvaPage = sec.VirtualAddress;
+                 rvaPage + kPageSize <= secVAEnd;
+                 rvaPage += static_cast<DWORD>(kPageSize)) {
+                if (strippedPageRvas.contains(rvaPage)) continue;
+
+                const size_t fileOff =
+                    static_cast<size_t>(sec.PointerToRawData) +
+                    static_cast<size_t>(rvaPage - sec.VirtualAddress);
+                if (fileOff + kPageSize > outBuf.size()) break;
+
+                const bool allNop = std::all_of(
+                    outBuf.data() + fileOff,
+                    outBuf.data() + fileOff + kPageSize,
+                    [](uint8_t b) { return b == 0x90; });
+
+                if (allNop) {
+                    memset(outBuf.data() + fileOff, 0xCC, kPageSize);
+                    strippedPageRvas.insert(rvaPage);
+                    ++secCleaned;
+                }
+            }
+
+            if (secCleaned > 0) {
+                char name[9] = {};
+                memcpy(name, sec.Name, 8);
+                std::cout << std::format(
+                    "[*] Replaced {} unread NOP-prefilled pages ({} KB) with 0xCC in {}\n",
+                    secCleaned, secCleaned * 4, name);
+                totalNopCleaned += secCleaned;
+            }
+        }
+        if (totalNopCleaned > 0) {
+            std::cout << std::format(
+                "[!] NOP-prefill cleanup: {} pages ({} KB) were never read from target "
+                "— replaced with int3 to prevent phantom auto-analysis\n",
+                totalNopCleaned, totalNopCleaned * 4);
+        }
+    }
+
+    // --------------------------------------------------------
     //  Filter .pdata. Drop RUNTIME_FUNCTION entries whose addresses
     //  are zero, inverted, land outside an executable section, or point
     //  into a page we just stripped to 0xCC.
@@ -433,6 +496,97 @@ bool PEFixer::Fix(const std::string& dumpFile, const std::string& peFile,
     //  waste cycles scanning solid-0xCC pages.
     // --------------------------------------------------------
     ImportRebuilder::Rebuild(outBuf, workingSections, hVMM, pid, modBase);
+
+    // --------------------------------------------------------
+    //  Detect dead entry point.
+    //
+    //  Kernel drivers have an INIT section that the kernel
+    //  discards after DriverEntry returns.  A post-init DMA
+    //  dump captures this as all-zero (or all-NOP from prefill,
+    //  now converted to 0xCC above).  If AddressOfEntryPoint
+    //  lands there, IDA cannot trace the call graph from the
+    //  entry — log a clear message.
+    // --------------------------------------------------------
+    {
+        const DWORD ep = is64
+            ? reinterpret_cast<IMAGE_NT_HEADERS64*>(ntOut)->OptionalHeader.AddressOfEntryPoint
+            : reinterpret_cast<IMAGE_NT_HEADERS32*>(ntOut)->OptionalHeader.AddressOfEntryPoint;
+
+        if (ep) {
+            size_t epRaw = SIZE_MAX;
+            char   epSecName[9] = {};
+            for (const auto& sec : workingSections) {
+                if (ep >= sec.VirtualAddress &&
+                    ep <  sec.VirtualAddress + sec.Misc.VirtualSize) {
+                    epRaw = static_cast<size_t>(sec.PointerToRawData) +
+                            (ep - sec.VirtualAddress);
+                    memcpy(epSecName, sec.Name, 8);
+                    break;
+                }
+            }
+
+            if (epRaw != SIZE_MAX) {
+                const size_t checkLen = std::min<size_t>(64, outBuf.size() - epRaw);
+                if (checkLen > 0) {
+                    const uint8_t firstByte = outBuf[epRaw];
+                    const bool dead = std::all_of(
+                        outBuf.data() + epRaw,
+                        outBuf.data() + epRaw + checkLen,
+                        [](uint8_t b) { return b == 0x90 || b == 0x00 || b == 0xCC; });
+
+                    if (dead) {
+                        const char* fillName = (firstByte == 0x90) ? "NOP"
+                                             : (firstByte == 0xCC) ? "int3"
+                                             : "zero";
+                        std::cout << std::format(
+                            "[!] DEAD ENTRY POINT — AddressOfEntryPoint (RVA 0x{:X}) in "
+                            "section '{}' is {} fill.\n"
+                            "    For kernel drivers: INIT section is discarded by the "
+                            "kernel after DriverEntry returns.\n"
+                            "    In IDA: trace xrefs to IoCreateDevice / IofCompleteRequest "
+                            "or browse MajorFunction dispatch handlers to find the real "
+                            "init code.\n",
+                            ep, epSecName, fillName);
+                    }
+                }
+            }
+        }
+    }
+
+    // --------------------------------------------------------
+    //  Log packer artifact sections.
+    //
+    //  Known packer section names (.upx, UPX0/1, .vmp0/1,
+    //  .themida, etc.) signal that the PE was packed before
+    //  loading.  After a post-load DMA dump most of these
+    //  sections contain stale compressed data, not executable
+    //  code — but some packers (or custom schemes) leave a mix
+    //  of real + packed pages, so we log them rather than
+    //  blindly stripping the execute bit.
+    // --------------------------------------------------------
+    {
+        static constexpr const char* kPackerNames[] = {
+            ".upx",  "UPX0",  "UPX1",  ".vmp0", ".vmp1",
+            ".themid", ".aspack", ".adata", ".nsp0", ".nsp1",
+        };
+        for (const auto& sec : workingSections) {
+            char name[9] = {};
+            memcpy(name, sec.Name, 8);
+            for (const char* pat : kPackerNames) {
+                if (strncmp(name, pat, strlen(pat)) == 0) {
+                    std::cout << std::format(
+                        "[~] Packer artifact section '{}' detected "
+                        "(RVA 0x{:X}, {} KB, {})\n",
+                        name, sec.VirtualAddress,
+                        sec.Misc.VirtualSize / 1024,
+                        (sec.Characteristics & IMAGE_SCN_MEM_EXECUTE)
+                            ? "executable — may contain mixed real + packed data"
+                            : "non-executable");
+                    break;
+                }
+            }
+        }
+    }
 
     // --------------------------------------------------------
     //  Write output
