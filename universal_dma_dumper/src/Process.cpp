@@ -119,6 +119,54 @@ void Process::ListModules(VMM_HANDLE hVMM, DWORD pid) {
     std::cout << '\n';
 }
 
+std::string Process::ResolveModuleName(VMM_HANDLE hVMM, DWORD pid,
+                                       const std::string& pattern) {
+    // Fast path: if the pattern is already an exact module name, skip enumeration.
+    {
+        ULONG64 base = 0; DWORD size = 0;
+        if (GetModuleInfo(hVMM, pid, pattern, base, size))
+            return pattern;
+    }
+
+    PVMMDLL_MAP_MODULE pMap = nullptr;
+    if (!VMMDLL_Map_GetModuleW(hVMM, pid, &pMap, 0)) {
+        std::cerr << "[!] ResolveModuleName: VMMDLL_Map_GetModuleW failed\n";
+        return {};
+    }
+
+    std::regex re;
+    try {
+        re.assign(pattern, std::regex_constants::icase | std::regex_constants::ECMAScript);
+    } catch (const std::regex_error& e) {
+        std::cerr << std::format("[!] Invalid regex pattern '{}': {}\n", pattern, e.what());
+        VMMDLL_MemFree(pMap);
+        return {};
+    }
+
+    std::vector<std::string> matches;
+    for (DWORD i = 0; i < pMap->cMap; ++i) {
+        std::string name = wtou8(pMap->pMap[i].wszText);
+        if (std::regex_search(name, re))
+            matches.push_back(std::move(name));
+    }
+    VMMDLL_MemFree(pMap);
+
+    if (matches.empty()) {
+        std::cerr << std::format("[!] No module matching '{}'\n", pattern);
+        return {};
+    }
+    if (matches.size() == 1) {
+        std::cout << std::format("[+] Resolved '{}' -> {}\n", pattern, matches[0]);
+        return matches[0];
+    }
+
+    std::cerr << std::format("[!] Pattern '{}' matched {} modules (be more specific):\n",
+                             pattern, matches.size());
+    for (const auto& m : matches)
+        std::cerr << std::format("      {}\n", m);
+    return {};
+}
+
 ModuleLayout Process::GetModuleLayout(VMM_HANDLE hVMM, DWORD pid, const std::string& moduleName) {
     ModuleLayout layout;
 

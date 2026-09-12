@@ -145,6 +145,15 @@ int main(int argc, char* argv[]) {
     }
 
     // --------------------------------------------------------
+    //  Resolve module name (supports partial / regex patterns)
+    // --------------------------------------------------------
+    moduleArg = Process::ResolveModuleName(hVMM, pid, moduleArg);
+    if (moduleArg.empty()) {
+        VMMDLL_Close(hVMM);
+        return 1;
+    }
+
+    // --------------------------------------------------------
     //  Get module base + size
     // --------------------------------------------------------
     ULONG64 modBase = 0;

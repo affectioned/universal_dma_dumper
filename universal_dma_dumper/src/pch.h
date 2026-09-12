@@ -24,6 +24,8 @@
 // std::unordered_map<ULONG64, uint64_t> pendingHashes;
 #include <unordered_map>
 
+#include <regex>
+
 // const auto   startTime = std::chrono::steady_clock::now();
 #include <chrono>
 

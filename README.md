@@ -30,7 +30,7 @@ universal_dma_dumper.exe -name <ProcessName> -list-modules
 | Argument | Description |
 |---|---|
 | `-name` | Target process name (e.g. `game.exe`) — required unless `-list-drivers` is used |
-| `-module` | Specific module to dump (e.g. `engine.dll`). Defaults to the process executable |
+| `-module` | Module to dump — exact name or regex pattern (e.g. `engine.dll`, `elytra.*`). Defaults to the process executable |
 | `-out` | Output directory. Defaults to `./dumps` |
 | `-list-drivers` | Enumerate every loaded kernel driver (PID 4) and exit. `-name` defaults to `System` |
 | `-list-modules` | Enumerate every module in the given process and exit. Requires `-name` |

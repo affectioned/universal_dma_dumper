@@ -24,4 +24,12 @@ public:
     // alphabetically by name. Manually-mapped modules that unlink from the
     // PEB / PsLoadedModuleList are invisible to this enumeration by design.
     static void ListModules(VMM_HANDLE hVMM, DWORD pid);
+
+    // Resolves a module name pattern (substring or regex) against the module
+    // list.  Returns the exact module name on a single match, or empty string
+    // on zero / ambiguous matches (printing diagnostics in both cases).
+    // A pattern that already matches a module name exactly is returned as-is
+    // without enumeration.
+    static std::string ResolveModuleName(VMM_HANDLE hVMM, DWORD pid,
+                                         const std::string& pattern);
 };
