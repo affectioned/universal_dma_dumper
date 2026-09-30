@@ -353,10 +353,14 @@ void Process::WatchHidden(VMM_HANDLE hVMM, DWORD pid, const std::string& outDir,
                           bool watchAll, size_t minSize) {
     std::filesystem::create_directories(outDir);
 
-    // visible: bases currently in the hidden set. Value counts consecutive
-    // "still present" observations — unused right now, kept for future use
-    // (e.g. only dump after a region has been visible for N ticks).
-    std::unordered_map<ULONG64, int> visible;
+    // visible: every base currently in the VAD tree (unfiltered — populated
+    // from the raw scan). Used only to detect "new this tick".
+    std::unordered_set<ULONG64> visible;
+
+    // announced: bases we've logged a '+' event for. Only these produce '-'
+    // events when they vanish, so below-threshold noise never generates
+    // asymmetric log entries.
+    std::unordered_set<ULONG64> announced;
 
     // dumped: bases we've already scheduled a dump for. Prevents re-dumping
     // the same address every tick while the region is still visible, and
@@ -386,8 +390,8 @@ void Process::WatchHidden(VMM_HANDLE hVMM, DWORD pid, const std::string& outDir,
         }
         size_t mzCount = 0;
         for (const auto& r : regions) {
-            visible[r.vaStart] = 0;
-            dumped.insert(r.vaStart);
+            visible.insert(r.vaStart);
+            dumped.insert(r.vaStart);          // baseline == "don't dump this"
             if (r.hasMZ) ++mzCount;
         }
         watchLog(std::format("Baseline: {} hidden regions ignored ({} with MZ)",
@@ -417,14 +421,18 @@ void Process::WatchHidden(VMM_HANDLE hVMM, DWORD pid, const std::string& outDir,
         }
         failStreak = 0;
 
-        // Track only bases that pass the log filter so disappearances of
-        // below-threshold noise don't fire '-' events for things we never
-        // announced a '+' for.
-        std::unordered_set<ULONG64> loggedThisTick;
-        loggedThisTick.reserve(regions.size());
+        // Build the raw "everything currently in the VAD tree" set. Membership
+        // here is used for the vanish check on `visible` (unfiltered) and for
+        // the `announced` disappearance check (below).
+        std::unordered_set<ULONG64> currentSet;
+        currentSet.reserve(regions.size());
+        for (const auto& r : regions) currentSet.insert(r.vaStart);
 
         // 1) Appearances — regions in current scan but not previously visible.
         for (const auto& r : regions) {
+            if (visible.contains(r.vaStart)) continue;
+            visible.insert(r.vaStart);
+
             const ULONG64 regionSize = r.vaEnd - r.vaStart;
 
             // Log filter: skip small non-MZ noise (JIT trampoline pool pages,
@@ -434,11 +442,8 @@ void Process::WatchHidden(VMM_HANDLE hVMM, DWORD pid, const std::string& outDir,
             // seeing.
             const bool worthLogging = r.hasMZ || regionSize >= minSize;
             if (!worthLogging) continue;
-            loggedThisTick.insert(r.vaStart);
 
-            if (visible.contains(r.vaStart)) continue;
-            visible[r.vaStart] = 0;
-
+            announced.insert(r.vaStart);
             watchLog(std::format("+ 0x{:016X}  size=0x{:X}  {}  vad='{}'",
                                  r.vaStart, regionSize,
                                  r.hasMZ ? "MZ" : "--",
@@ -490,15 +495,22 @@ void Process::WatchHidden(VMM_HANDLE hVMM, DWORD pid, const std::string& outDir,
             });
         }
 
-        // 2) Disappearances — bases we were tracking but are no longer in the
-        //    filtered current-tick set. Kept in `dumped` so a flap doesn't
-        //    retrigger a walk on the same VA. (currentSet is built from all
-        //    scanned regions and used only for erase-vs-keep bookkeeping on
-        //    `dumped`; visible-set tracking uses the filtered loggedThisTick.)
+        // 2) Prune `visible` — anything no longer in the VAD tree drops out.
+        //    No log event fires here; that's `announced`'s job below.
         for (auto it = visible.begin(); it != visible.end(); ) {
-            if (loggedThisTick.contains(it->first)) { ++it; continue; }
-            watchLog(std::format("- 0x{:016X}  vanished", it->first));
+            if (currentSet.contains(*it)) { ++it; continue; }
             it = visible.erase(it);
+        }
+
+        // 3) Disappearances — bases we logged '+' for but are gone now.
+        //    `announced` is a strict subset of what we announced, so this only
+        //    fires for events the user actually saw. Kept out of `dumped` so a
+        //    flap doesn't retrigger a walk on the same VA (dumped is never
+        //    cleared for the session's lifetime).
+        for (auto it = announced.begin(); it != announced.end(); ) {
+            if (currentSet.contains(*it)) { ++it; continue; }
+            watchLog(std::format("- 0x{:016X}  vanished", *it));
+            it = announced.erase(it);
         }
     }
 
