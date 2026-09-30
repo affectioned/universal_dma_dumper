@@ -45,3 +45,4 @@ dumps/
 *.bin
 *.dmp
 /.claude
+*.log
