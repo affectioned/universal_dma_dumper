@@ -20,7 +20,10 @@ struct ModuleLayout {
 // user-mode cheat protections, some info-stealer loaders).
 //
 // Populated from VMMDLL_Map_GetVadW with fIdentifyModules=TRUE:
-//   - vaStart / vaEnd    : VAD range
+//   - vaStart / vaEnd    : VAD range. vaEnd is EXCLUSIVE (one past the last
+//                          byte). MemProcFS returns an inclusive last-byte
+//                          address; ScanHiddenRegions adds 1 so that
+//                          (vaEnd - vaStart) is the real byte size.
 //   - protection         : raw 5-bit MM_PROTECTION_MASK value
 //   - fImage             : VAD backs a mapped PE image (should be false for hidden mods)
 //   - fPrivate           : VAD is private memory (VirtualAlloc / NtAllocateVirtualMemory)
@@ -29,7 +32,7 @@ struct ModuleLayout {
 //   - vadText            : VMMDLL_MAP_VADENTRY.wszText (module hint when MemProcFS identified one)
 struct HiddenRegion {
     ULONG64 vaStart      = 0;
-    ULONG64 vaEnd        = 0;
+    ULONG64 vaEnd        = 0;    // EXCLUSIVE — see comment above
     DWORD   protection   = 0;
     bool    fImage       = false;
     bool    fPrivate     = false;

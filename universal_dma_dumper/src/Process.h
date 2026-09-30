@@ -36,7 +36,14 @@ public:
     // executable region that is NOT covered by an entry in the process's
     // module map. Regions are enriched with a first-page probe: hasMZ +
     // peSizeOfImage. Suitable inputs for -base/-size dumping.
-    static std::vector<HiddenRegion> ScanHiddenRegions(VMM_HANDLE hVMM, DWORD pid);
+    //
+    // outOk, when non-null, is set to true on a successful walk (including
+    // "no matches") and false when VMMDLL_Map_GetVadW itself failed — the
+    // usual reason being that the target PID no longer exists. WatchHidden
+    // uses this to distinguish "quiet scan" from "process died" and exit
+    // instead of spinning on repeated VAD failures.
+    static std::vector<HiddenRegion> ScanHiddenRegions(VMM_HANDLE hVMM, DWORD pid,
+                                                       bool* outOk = nullptr);
 
     // Renders the ScanHiddenRegions result as a table with the same styling as
     // ListModules. Kept out of the scanner so callers can reuse the raw data.

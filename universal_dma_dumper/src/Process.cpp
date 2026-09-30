@@ -213,8 +213,9 @@ DWORD Process::ProbePEImageSize(VMM_HANDLE hVMM, DWORD pid, ULONG64 base) {
     return 0;
 }
 
-std::vector<HiddenRegion> Process::ScanHiddenRegions(VMM_HANDLE hVMM, DWORD pid) {
+std::vector<HiddenRegion> Process::ScanHiddenRegions(VMM_HANDLE hVMM, DWORD pid, bool* outOk) {
     std::vector<HiddenRegion> out;
+    if (outOk) *outOk = false;
 
     // Build a sorted [base, end) list of every module the loader knows about so
     // we can quickly reject VAD ranges that are already covered. NOTLINKED /
@@ -244,7 +245,11 @@ std::vector<HiddenRegion> Process::ScanHiddenRegions(VMM_HANDLE hVMM, DWORD pid)
     // pop out of the noise even before we probe for MZ ourselves.
     PVMMDLL_MAP_VAD pVad = nullptr;
     if (!VMMDLL_Map_GetVadW(hVMM, pid, /*fIdentifyModules=*/TRUE, &pVad)) {
-        std::cerr << "[!] ScanHiddenRegions: VMMDLL_Map_GetVadW failed\n";
+        // Silent when caller wants to handle the failure (WatchHidden loops
+        // through here every tick; noisy cerr on process death spams the
+        // console). One-shot callers still see the error via outOk == nullptr.
+        if (!outOk)
+            std::cerr << "[!] ScanHiddenRegions: VMMDLL_Map_GetVadW failed\n";
         return out;
     }
 
@@ -263,7 +268,10 @@ std::vector<HiddenRegion> Process::ScanHiddenRegions(VMM_HANDLE hVMM, DWORD pid)
 
         HiddenRegion h{
             .vaStart       = v.vaStart,
-            .vaEnd         = v.vaEnd,
+            // MemProcFS stores vaEnd as the INCLUSIVE last byte address
+            // (a page returns vaEnd = vaStart + 0xFFF). Normalize to
+            // exclusive-end so (vaEnd - vaStart) is the real byte size.
+            .vaEnd         = v.vaEnd + 1,
             .protection    = v.Protection,
             .fImage        = static_cast<bool>(v.fImage),
             .fPrivate      = static_cast<bool>(v.fPrivateMemory),
@@ -274,6 +282,7 @@ std::vector<HiddenRegion> Process::ScanHiddenRegions(VMM_HANDLE hVMM, DWORD pid)
         out.push_back(std::move(h));
     }
     VMMDLL_MemFree(pVad);
+    if (outOk) *outOk = true;
 
     // MZ candidates first — those are almost certainly manually-mapped PEs and
     // are the interesting ones. Non-MZ private RX regions are usually JIT/JS
@@ -366,7 +375,12 @@ void Process::WatchHidden(VMM_HANDLE hVMM, DWORD pid, const std::string& outDir,
     // private RX regions (Steam runtime, V8, Panorama layout heap, etc.) that
     // are usually noise for a VAC-hunt scenario.
     {
-        auto regions = ScanHiddenRegions(hVMM, pid);
+        bool ok = true;
+        auto regions = ScanHiddenRegions(hVMM, pid, &ok);
+        if (!ok) {
+            watchLog("Initial VAD scan failed — target process gone before baseline. Aborting.");
+            return;
+        }
         size_t mzCount = 0;
         for (const auto& r : regions) {
             visible[r.vaStart] = 0;
@@ -377,12 +391,29 @@ void Process::WatchHidden(VMM_HANDLE hVMM, DWORD pid, const std::string& outDir,
                              regions.size(), mzCount));
     }
 
+    // Consecutive failed scans before declaring the target dead. A single
+    // failure could be transient (DMA hiccup, VMM cache reload); three in a
+    // row across ~750 ms is a solid signal that the process exited.
+    static constexpr int kMaxConsecutiveFailures = 3;
+    int failStreak = 0;
+
     // ---------------- watch loop ----------------
     while (true) {
         if (GetAsyncKeyState(VK_END) & 0x8000) break;
         std::this_thread::sleep_for(std::chrono::milliseconds(intervalMs));
 
-        auto regions = ScanHiddenRegions(hVMM, pid);
+        bool ok = true;
+        auto regions = ScanHiddenRegions(hVMM, pid, &ok);
+        if (!ok) {
+            if (++failStreak >= kMaxConsecutiveFailures) {
+                watchLog(std::format("Target process (PID {}) gone — {} consecutive VAD scan failures. Exiting.",
+                                     pid, failStreak));
+                break;
+            }
+            continue;
+        }
+        failStreak = 0;
+
         std::unordered_set<ULONG64> currentSet;
         currentSet.reserve(regions.size());
         for (const auto& r : regions) currentSet.insert(r.vaStart);
