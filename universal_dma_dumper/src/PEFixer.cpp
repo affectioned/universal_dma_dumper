@@ -497,6 +497,11 @@ bool PEFixer::Fix(const std::string& dumpFile, const std::string& peFile,
     // --------------------------------------------------------
     ImportRebuilder::Rebuild(outBuf, workingSections, hVMM, pid, modBase);
 
+    // Refresh ntOut — Rebuild resizes outBuf to append .idata2, which
+    // reallocates for large dumps and leaves the earlier pointer dangling
+    // (deref faults once the freed pages are decommitted by the CRT).
+    ntOut = reinterpret_cast<IMAGE_NT_HEADERS*>(outBuf.data() + dos->e_lfanew);
+
     // --------------------------------------------------------
     //  Detect dead entry point.
     //
