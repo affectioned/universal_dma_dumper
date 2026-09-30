@@ -81,6 +81,54 @@ int main(int argc, char* argv[]) {
     }
 
     // --------------------------------------------------------
+    //  -fix-only <rawfile>: rerun the PE reconstruction on an existing
+    //  _raw.bin without walking pages. Skips MemProcFS entirely so it works
+    //  offline; import rebuild is skipped in that case (PEFixer/ImportRebuilder
+    //  early-out when hVMM/pid are null).
+    // --------------------------------------------------------
+    {
+        auto fo = std::find(argv + 1, argv + argc, std::string_view("-fix-only"));
+        if (fo != argv + argc && std::next(fo) != argv + argc) {
+            const std::string rawIn = *std::next(fo);
+            if (!std::filesystem::exists(rawIn)) {
+                std::cerr << std::format("[!] -fix-only: file not found: {}\n", rawIn);
+                return 1;
+            }
+
+            std::filesystem::path p(rawIn);
+            std::string stem = p.stem().string();  // e.g. "server_raw"
+            if (stem.size() > 4 && stem.compare(stem.size() - 4, 4, "_raw") == 0)
+                stem.erase(stem.size() - 4);
+
+            // Extension: prefer -module's suffix when supplied, else .dll.
+            std::string ext = ".dll";
+            auto moit = std::find(argv + 1, argv + argc, std::string_view("-module"));
+            if (moit != argv + argc && std::next(moit) != argv + argc) {
+                std::string_view m = *std::next(moit);
+                const auto dot = m.rfind('.');
+                if (dot != std::string_view::npos) {
+                    std::string e{ m.substr(dot) };
+                    std::transform(e.begin(), e.end(), e.begin(), ::tolower);
+                    if (e == ".exe" || e == ".dll" || e == ".sys") ext = e;
+                }
+            }
+
+            const std::filesystem::path outPath = p.parent_path() / (stem + "_fixed" + ext);
+            std::cout << std::format("[*] -fix-only mode: {} -> {}\n",
+                                     rawIn, outPath.string());
+            std::cout << "[~] Skipping MemProcFS + import rebuild (offline fix)\n";
+
+            const ModuleLayout emptyLayout{};
+            if (!PEFixer::Fix(rawIn, outPath.string(), emptyLayout, nullptr, 0, 0)) {
+                std::cerr << "[!] FixPE failed.\n";
+                return 1;
+            }
+            std::cout << std::format("\n[+] Done.\n    Fixed PE : {}\n", outPath.string());
+            return 0;
+        }
+    }
+
+    // --------------------------------------------------------
     //  Parse -name. Required for dump / -list-modules / -list-unloaded /
     //  -scan-hidden; defaults to "System" for -list-drivers since kernel
     //  drivers live under PID 4.
@@ -106,7 +154,10 @@ int main(int argc, char* argv[]) {
                 << "                                               [-watch-all] [-min-size <bytes>] [-dump-baseline] [-out <dir>]\n"
                 << "                                                 (continuous -scan-hidden; auto-dumps new MZ regions\n"
                 << "                                                  and, with -watch-all, non-MZ regions >= -min-size;\n"
-                << "                                                  -dump-baseline also dumps everything present at startup)\n";
+                << "                                                  -dump-baseline also dumps everything present at startup)\n"
+                << "  dumper.exe -fix-only <raw.bin> [-module <name.ext>]\n"
+                << "                                                 (rerun PE reconstruction on an existing raw dump,\n"
+                << "                                                  offline; skips walker + import rebuild)\n";
             return 1;
         }
     }
