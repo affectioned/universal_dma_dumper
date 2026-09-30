@@ -1,5 +1,8 @@
 #include "pch.h"
 #include "Process.h"
+#include "PageWalker.h"
+#include "PEFixer.h"
+#include <ctime>
 
 DWORD Process::FindPidByName(VMM_HANDLE hVMM, const std::string& name) {
     DWORD pid = 0;
@@ -63,6 +66,7 @@ void Process::ListModules(VMM_HANDLE hVMM, DWORD pid) {
         ULONG64 vaBase;
         DWORD   cbImageSize;
         DWORD   cIAT;
+        VMMDLL_MODULE_TP tp;
         std::string name;
         std::string company;
         std::string fullName;
@@ -75,6 +79,7 @@ void Process::ListModules(VMM_HANDLE hVMM, DWORD pid) {
             .vaBase       = e.vaBase,
             .cbImageSize  = e.cbImageSize,
             .cIAT         = e.cIAT,
+            .tp           = e.tp,
             .name         = wtou8(e.wszText),
             .company      = e.pExVersionInfo ? wtou8(e.pExVersionInfo->wszCompanyName) : std::string{},
             .fullName     = wtou8(e.wszFullName),
@@ -82,6 +87,19 @@ void Process::ListModules(VMM_HANDLE hVMM, DWORD pid) {
         rows.push_back(std::move(r));
     }
     VMMDLL_MemFree(pMap);
+
+    // Human-readable TP tag. NOTLINKED/INJECTED are what we care about: MemProcFS
+    // detected a PE image in a VAD but the entry is missing from the loader
+    // lists (or the loader entry is fake). See VMMDLL_MODULE_TP in vmmdll.h.
+    auto tpStr = [](VMMDLL_MODULE_TP t) -> const char* {
+        switch (t) {
+            case VMMDLL_MODULE_TP_NORMAL:    return "NORMAL";
+            case VMMDLL_MODULE_TP_DATA:      return "DATA";
+            case VMMDLL_MODULE_TP_NOTLINKED: return "NOTLINK";
+            case VMMDLL_MODULE_TP_INJECTED:  return "INJECT";
+            default:                         return "?";
+        }
+    };
 
     // Alphabetical by name (case-insensitive, ASCII-only fold — good enough for module names).
     std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) {
@@ -98,25 +116,341 @@ void Process::ListModules(VMM_HANDLE hVMM, DWORD pid) {
     constexpr size_t kNameCol    = 40;
     constexpr size_t kCompanyCol = 34;
     constexpr size_t kPathCol    = 60;
+    constexpr size_t kTpCol      = 7;
 
     std::cout << std::format("\n[+] {} modules in PID {}:\n\n", rows.size(), pid);
-    std::cout << std::format("  {:<18}  {:>9}  {:>5}  {:<{}}  {:<{}}  {}\n",
+    std::cout << std::format("  {:<18}  {:>9}  {:>5}  {:<{}}  {:<{}}  {:<{}}  {}\n",
                              "BASE", "SIZE", "IAT",
+                             "TP",      kTpCol,
                              "NAME",    kNameCol,
                              "COMPANY", kCompanyCol,
                              "PATH");
-    std::cout << "  " << std::string(18 + 2 + 9 + 2 + 5 + 2 + kNameCol + 2 + kCompanyCol + 2 + kPathCol, '-') << '\n';
+    std::cout << "  " << std::string(18 + 2 + 9 + 2 + 5 + 2 + kTpCol + 2 + kNameCol + 2 + kCompanyCol + 2 + kPathCol, '-') << '\n';
 
     for (const auto& r : rows) {
-        std::cout << std::format("  0x{:016X}  {:>9}  {:>5}  {:<{}}  {:<{}}  {}\n",
+        std::cout << std::format("  0x{:016X}  {:>9}  {:>5}  {:<{}}  {:<{}}  {:<{}}  {}\n",
                                  r.vaBase,
                                  std::format("0x{:07X}", r.cbImageSize),
                                  r.cIAT,
+                                 tpStr(r.tp),                  kTpCol,
                                  clip(r.name,    kNameCol),    kNameCol,
                                  clip(r.company, kCompanyCol), kCompanyCol,
                                  clip(r.fullName, kPathCol));
     }
     std::cout << '\n';
+}
+
+void Process::ListUnloadedModules(VMM_HANDLE hVMM, DWORD pid) {
+    PVMMDLL_MAP_UNLOADEDMODULE pMap = nullptr;
+    if (!VMMDLL_Map_GetUnloadedModuleW(hVMM, pid, &pMap)) {
+        std::cerr << "[!] ListUnloadedModules: VMMDLL_Map_GetUnloadedModuleW failed\n";
+        return;
+    }
+
+    std::cout << std::format("\n[+] {} unloaded modules in PID {}:\n\n", pMap->cMap, pid);
+    if (pMap->cMap == 0) {
+        VMMDLL_MemFree(pMap);
+        std::cout << "  (empty)\n";
+        return;
+    }
+
+    std::cout << std::format("  {:<18}  {:>9}  {:<40}\n", "BASE", "SIZE", "NAME");
+    std::cout << "  " << std::string(18 + 2 + 9 + 2 + 40, '-') << '\n';
+    for (DWORD i = 0; i < pMap->cMap; ++i) {
+        const auto& e = pMap->pMap[i];
+        std::cout << std::format("  0x{:016X}  {:>9}  {}\n",
+                                 e.vaBase,
+                                 std::format("0x{:07X}", e.cbImageSize),
+                                 clip(wtou8(e.wszText), 40));
+    }
+    std::cout << '\n';
+    VMMDLL_MemFree(pMap);
+}
+
+// VAD Protection is a 5-bit MM_PROTECTION_MASK value. Low three bits encode
+// the base protection (0=noaccess, 1=RO, 2=X, 3=XR, 4=RW, 5=WCOPY,
+// 6=XRW, 7=XWCOPY); bits 3-4 flag guard/nocache/writecombine. Bit 1 of the
+// low three bits is the execute bit, so `(p & 2) != 0` covers every X state.
+static bool VadIsExecutable(DWORD prot) { return (prot & 2) != 0; }
+
+// One-line human-readable protection string. Uses the same short form as
+// x64dbg / Process Hacker so it matches what a UC reader expects to see.
+static const char* VadProtStr(DWORD prot) {
+    switch (prot & 7) {
+        case 0: return "----";
+        case 1: return "R---";
+        case 2: return "--X-";
+        case 3: return "R-X-";
+        case 4: return "RW--";
+        case 5: return "RWC-";
+        case 6: return "RWX-";
+        case 7: return "RWXC";
+    }
+    return "?";
+}
+
+DWORD Process::ProbePEImageSize(VMM_HANDLE hVMM, DWORD pid, ULONG64 base) {
+    uint8_t buf[0x400] = {};
+    DWORD   cbRead = 0;
+    // ZEROPAD_ON_FAIL so an unreadable page returns zeros instead of failing —
+    // matches the page walker's philosophy and lets us handle partial reads.
+    VMMDLL_MemReadEx(hVMM, pid, base, buf, sizeof(buf), &cbRead,
+                     VMMDLL_FLAG_ZEROPAD_ON_FAIL | VMMDLL_FLAG_NOCACHE);
+    if (cbRead < sizeof(IMAGE_DOS_HEADER)) return 0;
+
+    auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(buf);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return 0;
+    if (dos->e_lfanew <= 0 || static_cast<DWORD>(dos->e_lfanew) + sizeof(IMAGE_NT_HEADERS64) > sizeof(buf))
+        return 0;
+
+    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(buf + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return 0;
+
+    if (nt->FileHeader.Machine == IMAGE_FILE_MACHINE_AMD64)
+        return reinterpret_cast<IMAGE_NT_HEADERS64*>(nt)->OptionalHeader.SizeOfImage;
+    if (nt->FileHeader.Machine == IMAGE_FILE_MACHINE_I386)
+        return reinterpret_cast<IMAGE_NT_HEADERS32*>(nt)->OptionalHeader.SizeOfImage;
+    return 0;
+}
+
+std::vector<HiddenRegion> Process::ScanHiddenRegions(VMM_HANDLE hVMM, DWORD pid) {
+    std::vector<HiddenRegion> out;
+
+    // Build a sorted [base, end) list of every module the loader knows about so
+    // we can quickly reject VAD ranges that are already covered. NOTLINKED /
+    // INJECTED modules that MemProcFS identified are included here too — those
+    // are already surfaced by -list-modules, so no need to duplicate them.
+    PVMMDLL_MAP_MODULE pModMap = nullptr;
+    struct ModRange { ULONG64 base; ULONG64 end; };
+    std::vector<ModRange> modRanges;
+    if (VMMDLL_Map_GetModuleW(hVMM, pid, &pModMap, VMMDLL_MODULE_FLAG_NORMAL)) {
+        modRanges.reserve(pModMap->cMap);
+        for (DWORD i = 0; i < pModMap->cMap; ++i)
+            modRanges.push_back({ pModMap->pMap[i].vaBase,
+                                  pModMap->pMap[i].vaBase + pModMap->pMap[i].cbImageSize });
+        VMMDLL_MemFree(pModMap);
+        std::sort(modRanges.begin(), modRanges.end(),
+                  [](const ModRange& a, const ModRange& b) { return a.base < b.base; });
+    }
+    auto coveredByModule = [&](ULONG64 va) {
+        for (const auto& r : modRanges)
+            if (va >= r.base && va < r.end) return true;
+        return false;
+    };
+
+    // fIdentifyModules=TRUE asks MemProcFS to run its PE image identifier over
+    // every VAD; when it finds a valid image the entry's wszText is populated
+    // with a friendly hint. That hint is what makes truly-hidden PE images
+    // pop out of the noise even before we probe for MZ ourselves.
+    PVMMDLL_MAP_VAD pVad = nullptr;
+    if (!VMMDLL_Map_GetVadW(hVMM, pid, /*fIdentifyModules=*/TRUE, &pVad)) {
+        std::cerr << "[!] ScanHiddenRegions: VMMDLL_Map_GetVadW failed\n";
+        return out;
+    }
+
+    for (DWORD i = 0; i < pVad->cMap; ++i) {
+        const auto& v = pVad->pMap[i];
+
+        // We only care about private, executable regions the loader does not
+        // know about. Image-backed VADs are file-mapped PEs (already surfaced
+        // via the module map), stacks/TEBs/heaps are legit private RX rarely,
+        // and non-executable regions can't hold running code.
+        if (v.fImage)                    continue;
+        if (!v.fPrivateMemory)           continue;
+        if (!VadIsExecutable(v.Protection)) continue;
+        if (v.fStack || v.fTeb)          continue;
+        if (coveredByModule(v.vaStart))  continue;
+
+        HiddenRegion h{
+            .vaStart       = v.vaStart,
+            .vaEnd         = v.vaEnd,
+            .protection    = v.Protection,
+            .fImage        = static_cast<bool>(v.fImage),
+            .fPrivate      = static_cast<bool>(v.fPrivateMemory),
+        };
+        h.vadText = wtou8(v.wszText);
+        h.peSizeOfImage = ProbePEImageSize(hVMM, pid, v.vaStart);
+        h.hasMZ = (h.peSizeOfImage != 0);
+        out.push_back(std::move(h));
+    }
+    VMMDLL_MemFree(pVad);
+
+    // MZ candidates first — those are almost certainly manually-mapped PEs and
+    // are the interesting ones. Non-MZ private RX regions are usually JIT/JS
+    // engine code, shellcode payloads, or trampoline pools.
+    std::sort(out.begin(), out.end(), [](const HiddenRegion& a, const HiddenRegion& b) {
+        if (a.hasMZ != b.hasMZ) return a.hasMZ;
+        return a.vaStart < b.vaStart;
+    });
+    return out;
+}
+
+void Process::PrintHiddenRegions(const std::vector<HiddenRegion>& regions) {
+    std::cout << std::format("\n[+] {} hidden executable regions:\n\n", regions.size());
+    if (regions.empty()) {
+        std::cout << "  (none — no private RX VADs outside the loader's module map)\n\n";
+        return;
+    }
+
+    constexpr size_t kHintCol = 40;
+    std::cout << std::format("  {:<18}  {:>9}  {:<5}  {:<3}  {:>10}  {:<{}}\n",
+                             "BASE", "VADSIZE", "PROT", "MZ ", "PESIZE", "VADHINT", kHintCol);
+    std::cout << "  " << std::string(18 + 2 + 9 + 2 + 5 + 2 + 3 + 2 + 10 + 2 + kHintCol, '-') << '\n';
+
+    for (const auto& r : regions) {
+        std::cout << std::format("  0x{:016X}  {:>9}  {:<5}  {:<3}  {:>10}  {:<{}}\n",
+                                 r.vaStart,
+                                 std::format("0x{:07X}", r.vaEnd - r.vaStart),
+                                 VadProtStr(r.protection),
+                                 r.hasMZ ? "MZ" : "-",
+                                 r.peSizeOfImage ? std::format("0x{:07X}", r.peSizeOfImage) : std::string("-"),
+                                 clip(r.vadText, kHintCol), kHintCol);
+    }
+
+    std::cout << "\n"
+                 "  To dump one: universal_dma_dumper.exe -name <proc> -base 0x<VA> [-size 0x<N>]\n"
+                 "               (size auto-derived from the PE header when MZ = MZ)\n\n";
+}
+
+// ---------------------------------------------------------------------------
+//  Watch loop — continuous VAD scan with auto-dump on new MZ candidates.
+// ---------------------------------------------------------------------------
+
+namespace {
+    // Single mutex serializes every stdout write across the watcher thread and
+    // every dump worker thread. PageWalker's own progress lines still bypass
+    // this (they call std::cout directly), so worker progress will interleave
+    // with watch events — grep for the '+ 0x', '- 0x', '\xE2\x9C\x93 0x' and
+    // '! 0x' prefixes to see the structured event stream cleanly.
+    std::mutex g_watchOutMutex;
+
+    void watchLog(const std::string& msg) {
+        auto now = std::chrono::system_clock::now();
+        auto tt  = std::chrono::system_clock::to_time_t(now);
+        auto ms  = std::chrono::duration_cast<std::chrono::milliseconds>(
+                       now.time_since_epoch()) % 1000;
+        std::tm tm{};
+        localtime_s(&tm, &tt);
+
+        std::lock_guard lk(g_watchOutMutex);
+        std::cout << std::format("[{:02}:{:02}:{:02}.{:03}] {}\n",
+                                 tm.tm_hour, tm.tm_min, tm.tm_sec,
+                                 static_cast<int>(ms.count()), msg);
+    }
+}
+
+void Process::WatchHidden(VMM_HANDLE hVMM, DWORD pid, const std::string& outDir,
+                          uint32_t intervalMs, size_t maxConcurrent) {
+    std::filesystem::create_directories(outDir);
+
+    // visible: bases currently in the hidden set. Value counts consecutive
+    // "still present" observations — unused right now, kept for future use
+    // (e.g. only dump after a region has been visible for N ticks).
+    std::unordered_map<ULONG64, int> visible;
+
+    // dumped: bases we've already scheduled a dump for. Prevents re-dumping
+    // the same address every tick while the region is still visible, and
+    // (usefully) also debounces same-base remaps that flap in and out.
+    std::unordered_set<ULONG64> dumped;
+
+    std::atomic<size_t> active{ 0 };
+    std::vector<std::thread> workers;
+
+    watchLog(std::format("Watch started (pid={}, interval={} ms, maxConcurrent={}, out={})",
+                         pid, intervalMs, maxConcurrent, outDir));
+    watchLog("Press END to stop (waits for outstanding dumps).");
+
+    // ---------------- baseline pass ----------------
+    // Every region present at startup is added to both `visible` and `dumped`.
+    // This suppresses the wall of '+ 0x...' events for legitimate long-lived
+    // private RX regions (Steam runtime, V8, Panorama layout heap, etc.) that
+    // are usually noise for a VAC-hunt scenario.
+    {
+        auto regions = ScanHiddenRegions(hVMM, pid);
+        size_t mzCount = 0;
+        for (const auto& r : regions) {
+            visible[r.vaStart] = 0;
+            dumped.insert(r.vaStart);
+            if (r.hasMZ) ++mzCount;
+        }
+        watchLog(std::format("Baseline: {} hidden regions ignored ({} with MZ)",
+                             regions.size(), mzCount));
+    }
+
+    // ---------------- watch loop ----------------
+    while (true) {
+        if (GetAsyncKeyState(VK_END) & 0x8000) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(intervalMs));
+
+        auto regions = ScanHiddenRegions(hVMM, pid);
+        std::unordered_set<ULONG64> currentSet;
+        currentSet.reserve(regions.size());
+        for (const auto& r : regions) currentSet.insert(r.vaStart);
+
+        // 1) Appearances — regions in current scan but not previously visible.
+        for (const auto& r : regions) {
+            if (visible.contains(r.vaStart)) continue;
+            visible[r.vaStart] = 0;
+
+            watchLog(std::format("+ 0x{:016X}  size=0x{:X}  {}  vad='{}'",
+                                 r.vaStart, r.vaEnd - r.vaStart,
+                                 r.hasMZ ? "MZ" : "--",
+                                 r.vadText.empty() ? std::string("(none)") : r.vadText));
+
+            // Only auto-dump MZ candidates. Non-MZ regions are usually JIT
+            // trampolines / shellcode payloads — interesting but noisy and
+            // usually not what a VAC hunt wants.
+            if (!r.hasMZ)                          continue;
+            if (dumped.contains(r.vaStart))        continue;
+
+            if (active.load() >= maxConcurrent) {
+                watchLog(std::format("! 0x{:016X}  skipped: at concurrent-dump cap ({})",
+                                     r.vaStart, maxConcurrent));
+                continue;
+            }
+
+            dumped.insert(r.vaStart);
+            ++active;
+
+            const ULONG64 base = r.vaStart;
+            const DWORD   size = r.peSizeOfImage
+                                 ? r.peSizeOfImage
+                                 : static_cast<DWORD>(r.vaEnd - r.vaStart);
+
+            workers.emplace_back([hVMM, pid, base, size, outDir, &active]() {
+                const std::string rawFile   = std::format("{}/hidden_{:016X}_raw.bin",   outDir, base);
+                const std::string fixedFile = std::format("{}/hidden_{:016X}_fixed.dll", outDir, base);
+                try {
+                    PageWalker w(hVMM, pid, base, size, rawFile);
+                    w.Run();
+                    // No MemProcFS layout for a hidden region — PEFixer's
+                    // fallback path reads sections/directories from the dump's
+                    // own headers, which manual-map loaders usually keep intact.
+                    ModuleLayout empty;
+                    PEFixer::Fix(rawFile, fixedFile, empty, hVMM, pid, base);
+                    watchLog(std::format("v 0x{:016X}  dumped: {}", base, fixedFile));
+                } catch (const std::exception& e) {
+                    watchLog(std::format("! 0x{:016X}  dump threw: {}", base, e.what()));
+                } catch (...) {
+                    watchLog(std::format("! 0x{:016X}  dump threw (unknown)", base));
+                }
+                --active;
+            });
+        }
+
+        // 2) Disappearances — bases we were tracking but are no longer in scan.
+        //    Kept in `dumped` so a flap doesn't retrigger a walk on the same VA.
+        for (auto it = visible.begin(); it != visible.end(); ) {
+            if (currentSet.contains(it->first)) { ++it; continue; }
+            watchLog(std::format("- 0x{:016X}  vanished", it->first));
+            it = visible.erase(it);
+        }
+    }
+
+    watchLog(std::format("Watch stopping — {} outstanding dump(s), waiting...",
+                         active.load()));
+    for (auto& t : workers) if (t.joinable()) t.join();
+    watchLog("Watch stopped.");
 }
 
 std::string Process::ResolveModuleName(VMM_HANDLE hVMM, DWORD pid,

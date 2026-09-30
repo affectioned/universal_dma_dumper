@@ -22,26 +22,74 @@ Original page walker logic by [zarboz on UnknownCheats](https://www.unknowncheat
 ```
 universal_dma_dumper.exe -name <ProcessName>
 universal_dma_dumper.exe -name <ProcessName> -module <ModuleName.dll>
+universal_dma_dumper.exe -name <ProcessName> -base 0x<VA> [-size 0x<N>]
 universal_dma_dumper.exe -name <ProcessName> -out <dir>
 universal_dma_dumper.exe -list-drivers
 universal_dma_dumper.exe -name <ProcessName> -list-modules
+universal_dma_dumper.exe -name <ProcessName> -list-unloaded
+universal_dma_dumper.exe -name <ProcessName> -scan-hidden
+universal_dma_dumper.exe -name <ProcessName> -watch-hidden [-watch-interval <ms>] [-max-concurrent <N>]
 ```
 
 | Argument | Description |
 |---|---|
 | `-name` | Target process name (e.g. `game.exe`) — required unless `-list-drivers` is used |
 | `-module` | Module to dump — exact name or regex pattern (e.g. `engine.dll`, `elytra.*`). Defaults to the process executable |
+| `-base` | Dump an arbitrary VA range directly (no module lookup). Use with `-scan-hidden` output for manually-mapped modules |
+| `-size` | Byte length of the `-base` range. Optional — auto-derived from `OptionalHeader.SizeOfImage` when the range begins with an `MZ/PE` header |
 | `-out` | Output directory. Defaults to `./dumps` |
 | `-list-drivers` | Enumerate every loaded kernel driver (PID 4) and exit. `-name` defaults to `System` |
-| `-list-modules` | Enumerate every module in the given process and exit. Requires `-name` |
+| `-list-modules` | Enumerate every module in the given process and exit. Includes a **TP** column so MemProcFS-identified `NOTLINKED` / `INJECTED` modules are visible without a hidden scan |
+| `-list-unloaded` | Dump the process's unloaded-module ring (or the kernel's `MmUnloadedDrivers` list when `-name System`). Useful for scan modules with a lifetime shorter than one `-list-modules` poll |
+| `-scan-hidden` | Single VAD scan for **manually-mapped modules**: private + executable regions not covered by any entry in the module map (VAC scan modules, most kernel-mode cheat protections, some info-stealer loaders). Regions whose first page still holds a valid PE header are marked `MZ` and their `SizeOfImage` is reported so `-base` can auto-derive `-size` |
+| `-watch-hidden` | **Continuous** `-scan-hidden` with auto-dump. Baselines the hidden set at startup so long-lived JIT/runtime arenas are ignored, then dumps every new `MZ`-flagged region to `-out` as it appears — designed for catching short-lived scan modules that vanish before a manual dump can be issued. Runs until END is pressed |
+| `-watch-interval` | Sleep between scans in ms (default `250`). Lower = better chance of catching sub-second appearances; higher = less DMA bandwidth |
+| `-max-concurrent` | Simultaneous background dumps allowed (default `4`). Additional appearances above the cap are logged as `!` skipped |
 
 Press **END** to stop the dump early. The PE fix will still run on whatever was collected.
 
 ### Listing modules
 
-`-list-drivers` and `-list-modules` print a table (base, size, IAT count, name, company, path) sorted by name — useful when you know a target is loaded but don't know its exact filename (kernel driver names sometimes rotate per install; usermode loaders sometimes hide behind generic filenames).
+`-list-drivers`, `-list-modules` and `-list-unloaded` print a table (base, size, IAT count, TP, name, company, path) sorted by name — useful when you know a target is loaded but don't know its exact filename (kernel driver names sometimes rotate per install; usermode loaders sometimes hide behind generic filenames).
 
-> Manually-mapped modules that unlink from the PEB / `PsLoadedModuleList` do **not** appear here — MemProcFS walks the same lists the loader maintains, so anything that erases its own entry is invisible by design. Finding those requires a VAD scan for anomalous RX regions, which this tool does not currently do.
+The **TP** column reflects MemProcFS's classification of each module:
+
+| TP | Meaning |
+|---|---|
+| `NORMAL` | Regular loader-linked module |
+| `DATA` | Non-executable image-backed mapping (resource-only DLL etc.) |
+| `NOTLINK` | PE image identified in a VAD but missing from `InLoadOrderModuleList` / `InMemoryOrderModuleList` |
+| `INJECT` | Loader entry present but MemProcFS flagged it as an injected image (e.g. `LdrpProcessMappedModule` inconsistency) |
+
+`NOTLINK` and `INJECT` rows are exactly the manually-mapped modules that older versions of this tool missed. If a target is fully stealth (PE header wiped + not identifiable via image structure), it still won't appear here — that's what `-scan-hidden` is for.
+
+### Catching manually-mapped modules
+
+Anti-cheat scan modules (VAC's runtime scanner, EasyAntiCheat's user-mode component in a few titles, etc.) are commonly loaded by the parent process into `MEM_PRIVATE` executable memory via `VirtualAlloc` + section-by-section copy, then have their `LDR_DATA_TABLE_ENTRY` unlinked from the PEB's three loader lists so a naïve `EnumProcessModules` / `MODULEENTRY32` walk cannot see them. Same technique is used by manual-map cheat loaders and most modern info-stealers.
+
+`-scan-hidden` walks the VAD tree with MemProcFS's `fIdentifyModules=TRUE` and prints every VAD that is:
+
+- `fPrivateMemory=1` (allocated, not backed by a mapped file/image)
+- Executable protection (any of `MM_EXECUTE`, `MM_EXECUTE_READ`, `MM_EXECUTE_READWRITE`, `MM_EXECUTE_WRITECOPY`)
+- Not a stack / TEB
+- Not covered by any entry in the loader's module map
+
+Regions where the first page still carries a parseable PE header are ranked to the top and annotated with `SizeOfImage`. Typical workflow:
+
+```
+universal_dma_dumper.exe -name deadlock.exe -scan-hidden
+
+  BASE                VADSIZE  PROT   MZ   PESIZE     VADHINT
+  ----------------------------------------------------------------
+  0x00007FFBAABB0000  0x1985000 R-X-  MZ   0x1985000  steamclient64.dll
+  0x000001C4A0000000  0x0600000 RWX-  MZ   0x05E0000  (no name)
+  0x000001C4A0800000  0x0002000 RWX-  -    -          (no name)
+  ...
+
+universal_dma_dumper.exe -name deadlock.exe -base 0x000001C4A0000000
+```
+
+With `-base` and no `-size`, the tool probes the PE header and uses `OptionalHeader.SizeOfImage`. Pass an explicit `-size` when the header has been erased post-load.
 
 ### Dumping kernel drivers
 

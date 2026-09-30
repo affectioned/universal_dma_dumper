@@ -35,6 +35,12 @@
 // std::this_thread::sleep_for(std::chrono::milliseconds(10));
 #include <thread>
 
+// std::mutex g_outMutex;
+#include <mutex>
+
+// std::atomic<size_t> active{0};
+#include <atomic>
+
 // std::filesystem::create_directories(g_outDir);
 #include <filesystem>
 
