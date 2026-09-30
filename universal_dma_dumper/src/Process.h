@@ -75,9 +75,15 @@ public:
     // and dumping — a small default (~256 KB) filters out JIT trampoline
     // pool pages that dominate an unfiltered scan. Runs until END is pressed.
     // Blocks the caller until all outstanding dumps complete.
+    //
+    // dumpBaseline: also dump every region present at startup (subject to
+    // the same MZ / watchAll / minSize rules). Use when the interesting
+    // module was mapped BEFORE the watcher started — the common case for
+    // helpers that init during game+Steam startup rather than at match time.
+    // Baseline entries are logged with a 'b' event prefix instead of '+'.
     static void WatchHidden(VMM_HANDLE hVMM, DWORD pid, const std::string& outDir,
                             uint32_t intervalMs, size_t maxConcurrent,
-                            bool watchAll, size_t minSize);
+                            bool watchAll, size_t minSize, bool dumpBaseline);
 
     // Resolves a module name pattern (substring or regex) against the module
     // list.  Returns the exact module name on a single match, or empty string

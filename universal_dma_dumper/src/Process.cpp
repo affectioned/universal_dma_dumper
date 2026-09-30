@@ -348,9 +348,42 @@ namespace {
     }
 }
 
+// Spawn one dump worker for a single hidden region. Returns true if the
+// dump was queued, false if we were at the concurrency cap. Increments
+// `active` on success; the worker decrements it when finished.
+static bool SpawnHiddenDump(VMM_HANDLE hVMM, DWORD pid, ULONG64 base, DWORD size,
+                            const std::string& outDir, size_t maxConcurrent,
+                            std::atomic<size_t>& active,
+                            std::vector<std::thread>& workers,
+                            void (*log)(const std::string&)) {
+    if (active.load() >= maxConcurrent) {
+        log(std::format("! 0x{:016X}  skipped: at concurrent-dump cap ({})",
+                        base, maxConcurrent));
+        return false;
+    }
+    ++active;
+    workers.emplace_back([hVMM, pid, base, size, outDir, &active, log]() {
+        const std::string rawFile   = std::format("{}/hidden_{:016X}_raw.bin",   outDir, base);
+        const std::string fixedFile = std::format("{}/hidden_{:016X}_fixed.dll", outDir, base);
+        try {
+            PageWalker w(hVMM, pid, base, size, rawFile);
+            w.Run();
+            ModuleLayout empty;                     // fixer falls back to dump headers
+            PEFixer::Fix(rawFile, fixedFile, empty, hVMM, pid, base);
+            log(std::format("v 0x{:016X}  dumped: {}", base, fixedFile));
+        } catch (const std::exception& e) {
+            log(std::format("! 0x{:016X}  dump threw: {}", base, e.what()));
+        } catch (...) {
+            log(std::format("! 0x{:016X}  dump threw (unknown)", base));
+        }
+        --active;
+    });
+    return true;
+}
+
 void Process::WatchHidden(VMM_HANDLE hVMM, DWORD pid, const std::string& outDir,
                           uint32_t intervalMs, size_t maxConcurrent,
-                          bool watchAll, size_t minSize) {
+                          bool watchAll, size_t minSize, bool dumpBaseline) {
     std::filesystem::create_directories(outDir);
 
     // visible: every base currently in the VAD tree (unfiltered — populated
@@ -371,9 +404,10 @@ void Process::WatchHidden(VMM_HANDLE hVMM, DWORD pid, const std::string& outDir,
     std::vector<std::thread> workers;
 
     watchLog(std::format("Watch started (pid={}, interval={} ms, maxConcurrent={}, "
-                         "minSize=0x{:X}, watchAll={}, out={})",
+                         "minSize=0x{:X}, watchAll={}, dumpBaseline={}, out={})",
                          pid, intervalMs, maxConcurrent, minSize,
-                         watchAll ? "true" : "false", outDir));
+                         watchAll ? "true" : "false",
+                         dumpBaseline ? "true" : "false", outDir));
     watchLog("Press END to stop (waits for outstanding dumps).");
 
     // ---------------- baseline pass ----------------
@@ -389,13 +423,46 @@ void Process::WatchHidden(VMM_HANDLE hVMM, DWORD pid, const std::string& outDir,
             return;
         }
         size_t mzCount = 0;
+        size_t worthCount = 0;
         for (const auto& r : regions) {
             visible.insert(r.vaStart);
-            dumped.insert(r.vaStart);          // baseline == "don't dump this"
             if (r.hasMZ) ++mzCount;
+            if (r.hasMZ || (r.vaEnd - r.vaStart) >= minSize) ++worthCount;
         }
-        watchLog(std::format("Baseline: {} hidden regions ignored ({} with MZ)",
-                             regions.size(), mzCount));
+        watchLog(std::format("Baseline: {} hidden regions total ({} with MZ, {} above minSize)",
+                             regions.size(), mzCount, worthCount));
+
+        // Show baseline entries that would have qualified for a '+' event.
+        // Non-noise-floor regions listed as 'b 0x…' so the user can see what
+        // was ignored by the watcher — often the interesting module is here
+        // (helpers that map during game/Steam startup, before this tool runs).
+        for (const auto& r : regions) {
+            const ULONG64 sz = r.vaEnd - r.vaStart;
+            if (!r.hasMZ && sz < minSize) continue;
+            watchLog(std::format("b 0x{:016X}  size=0x{:X}  {}  vad='{}'",
+                                 r.vaStart, sz,
+                                 r.hasMZ ? "MZ" : "--",
+                                 r.vadText.empty() ? std::string("(none)") : r.vadText));
+        }
+
+        if (dumpBaseline) {
+            watchLog("dumpBaseline=true — dumping every qualifying baseline entry now");
+            for (const auto& r : regions) {
+                const ULONG64 sz = r.vaEnd - r.vaStart;
+                if (!r.hasMZ && sz < minSize)      continue;
+                if (!r.hasMZ && !watchAll)         continue;
+                dumped.insert(r.vaStart);
+                const DWORD size = r.peSizeOfImage
+                                   ? r.peSizeOfImage
+                                   : static_cast<DWORD>(sz);
+                SpawnHiddenDump(hVMM, pid, r.vaStart, size, outDir,
+                                maxConcurrent, active, workers, watchLog);
+            }
+        } else {
+            // Standard behavior: mark every baseline region as dumped so
+            // future ticks won't retrigger a walk on the same VA.
+            for (const auto& r : regions) dumped.insert(r.vaStart);
+        }
     }
 
     // Consecutive failed scans before declaring the target dead. A single
@@ -460,39 +527,12 @@ void Process::WatchHidden(VMM_HANDLE hVMM, DWORD pid, const std::string& outDir,
             if (!shouldDump)                       continue;
             if (dumped.contains(r.vaStart))        continue;
 
-            if (active.load() >= maxConcurrent) {
-                watchLog(std::format("! 0x{:016X}  skipped: at concurrent-dump cap ({})",
-                                     r.vaStart, maxConcurrent));
-                continue;
-            }
-
             dumped.insert(r.vaStart);
-            ++active;
-
-            const ULONG64 base = r.vaStart;
-            const DWORD   size = r.peSizeOfImage
-                                 ? r.peSizeOfImage
-                                 : static_cast<DWORD>(regionSize);
-
-            workers.emplace_back([hVMM, pid, base, size, outDir, &active]() {
-                const std::string rawFile   = std::format("{}/hidden_{:016X}_raw.bin",   outDir, base);
-                const std::string fixedFile = std::format("{}/hidden_{:016X}_fixed.dll", outDir, base);
-                try {
-                    PageWalker w(hVMM, pid, base, size, rawFile);
-                    w.Run();
-                    // No MemProcFS layout for a hidden region — PEFixer's
-                    // fallback path reads sections/directories from the dump's
-                    // own headers, which manual-map loaders usually keep intact.
-                    ModuleLayout empty;
-                    PEFixer::Fix(rawFile, fixedFile, empty, hVMM, pid, base);
-                    watchLog(std::format("v 0x{:016X}  dumped: {}", base, fixedFile));
-                } catch (const std::exception& e) {
-                    watchLog(std::format("! 0x{:016X}  dump threw: {}", base, e.what()));
-                } catch (...) {
-                    watchLog(std::format("! 0x{:016X}  dump threw (unknown)", base));
-                }
-                --active;
-            });
+            const DWORD size = r.peSizeOfImage
+                               ? r.peSizeOfImage
+                               : static_cast<DWORD>(regionSize);
+            SpawnHiddenDump(hVMM, pid, r.vaStart, size, outDir,
+                            maxConcurrent, active, workers, watchLog);
         }
 
         // 2) Prune `visible` — anything no longer in the VAD tree drops out.

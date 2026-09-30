@@ -18,7 +18,7 @@ Original page-walker logic by [zarboz on UnknownCheats](https://www.unknowncheat
 universal_dma_dumper.exe -name <ProcessName> [-module <Name|Regex>] [-out <dir>]
 universal_dma_dumper.exe -name <ProcessName> -base 0x<VA> [-size 0x<N>]
 universal_dma_dumper.exe -name <ProcessName> -scan-hidden
-universal_dma_dumper.exe -name <ProcessName> -watch-hidden [-watch-interval <ms>] [-max-concurrent <N>] [-watch-all] [-min-size <bytes>]
+universal_dma_dumper.exe -name <ProcessName> -watch-hidden [-watch-interval <ms>] [-max-concurrent <N>] [-watch-all] [-min-size <bytes>] [-dump-baseline]
 universal_dma_dumper.exe -name <ProcessName> -list-modules | -list-unloaded
 universal_dma_dumper.exe -list-drivers
 ```
@@ -35,6 +35,7 @@ universal_dma_dumper.exe -list-drivers
 | `-max-concurrent` | Concurrent background dumps under `-watch-hidden` (default `4`) |
 | `-watch-all` | Also auto-dump non-`MZ` regions (for manual-mappers that wipe the PE header post-load). PE fix will fail — raw `.bin` is preserved for manual reconstruction |
 | `-min-size` | Log/dump noise floor in bytes (default `0x40000` = 256 KB). Filters JIT trampoline pool pages. MZ candidates always pass regardless of size |
+| `-dump-baseline` | Also dump every region present at startup (subject to `-watch-all` / `-min-size`). Use when the target module was mapped **before** the watcher started — helpers that init during game/Steam startup are the common case. Baseline entries log as `b 0x…` instead of `+ 0x…` |
 | `-list-modules` | Module table with a **TP** column (`NORMAL` / `DATA` / `NOTLINK` / `INJECT`) |
 | `-list-unloaded` | Loader's unloaded-module ring (or `MmUnloadedDrivers` for `System`) |
 | `-list-drivers` | Kernel drivers (PID 4 modules) |

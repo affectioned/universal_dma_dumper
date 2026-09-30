@@ -99,9 +99,10 @@ int main(int argc, char* argv[]) {
                 << "  dumper.exe -name <ProcessName> -list-unloaded  (dump the process's unloaded-module list)\n"
                 << "  dumper.exe -name <ProcessName> -scan-hidden    (VAD scan for private RX regions outside the module map)\n"
                 << "  dumper.exe -name <ProcessName> -watch-hidden [-watch-interval <ms>] [-max-concurrent <N>]\n"
-                << "                                               [-watch-all] [-min-size <bytes>] [-out <dir>]\n"
+                << "                                               [-watch-all] [-min-size <bytes>] [-dump-baseline] [-out <dir>]\n"
                 << "                                                 (continuous -scan-hidden; auto-dumps new MZ regions\n"
-                << "                                                  and, with -watch-all, non-MZ regions >= -min-size)\n";
+                << "                                                  and, with -watch-all, non-MZ regions >= -min-size;\n"
+                << "                                                  -dump-baseline also dumps everything present at startup)\n";
             return 1;
         }
     }
@@ -162,7 +163,8 @@ int main(int argc, char* argv[]) {
     // trampoline pool pages / hook stubs / per-object micro-allocations —
     // not what a manual-map hunt is looking for.
     ULONG64 minRegionSize   = 0x40000;
-    const bool watchAll     = std::find(argv + 1, argv + argc, std::string_view("-watch-all")) != argv + argc;
+    const bool watchAll      = std::find(argv + 1, argv + argc, std::string_view("-watch-all"))     != argv + argc;
+    const bool dumpBaseline  = std::find(argv + 1, argv + argc, std::string_view("-dump-baseline")) != argv + argc;
     it = std::find(argv + 1, argv + argc, std::string_view("-watch-interval"));
     if (it != argv + argc && std::next(it) != argv + argc && !parseNum(*std::next(it), watchIntervalMs)) {
         std::cerr << std::format("[!] Invalid -watch-interval value: {}\n", *std::next(it));
@@ -232,7 +234,8 @@ int main(int argc, char* argv[]) {
                              static_cast<uint32_t>(watchIntervalMs),
                              static_cast<size_t>(maxConcurrent),
                              watchAll,
-                             static_cast<size_t>(minRegionSize));
+                             static_cast<size_t>(minRegionSize),
+                             dumpBaseline);
         VMMDLL_Close(hVMM);
         return 0;
     }
