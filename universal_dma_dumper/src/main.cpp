@@ -17,6 +17,10 @@ protected:
         const auto ch = static_cast<char>(c);
         const int  ra = m_a ? m_a->sputc(ch) : ch;
         const int  rb = m_b ? m_b->sputc(ch) : ch;
+        // Flush the log side on every newline so a crash preserves
+        // everything up to the last complete line — otherwise the tail
+        // sits in the ofstream buffer and is lost on access violation.
+        if (m_b && ch == '\n') m_b->pubsync();
         return (ra == EOF || rb == EOF) ? EOF : c;
     }
     int sync() override {
