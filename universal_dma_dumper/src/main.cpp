@@ -98,8 +98,10 @@ int main(int argc, char* argv[]) {
                 << "  dumper.exe -name <ProcessName> -list-modules   (enumerate a process's modules, incl. NOTLINKED/INJECTED)\n"
                 << "  dumper.exe -name <ProcessName> -list-unloaded  (dump the process's unloaded-module list)\n"
                 << "  dumper.exe -name <ProcessName> -scan-hidden    (VAD scan for private RX regions outside the module map)\n"
-                << "  dumper.exe -name <ProcessName> -watch-hidden [-watch-interval <ms>] [-max-concurrent <N>] [-out <dir>]\n"
-                << "                                                 (continuous -scan-hidden; auto-dumps new MZ regions)\n";
+                << "  dumper.exe -name <ProcessName> -watch-hidden [-watch-interval <ms>] [-max-concurrent <N>]\n"
+                << "                                               [-watch-all] [-min-size <bytes>] [-out <dir>]\n"
+                << "                                                 (continuous -scan-hidden; auto-dumps new MZ regions\n"
+                << "                                                  and, with -watch-all, non-MZ regions >= -min-size)\n";
             return 1;
         }
     }
@@ -156,6 +158,11 @@ int main(int argc, char* argv[]) {
     // --------------------------------------------------------
     ULONG64 watchIntervalMs = 250;
     ULONG64 maxConcurrent   = 4;
+    // Default noise floor: 256 KB. Below that is almost always JIT
+    // trampoline pool pages / hook stubs / per-object micro-allocations —
+    // not what a manual-map hunt is looking for.
+    ULONG64 minRegionSize   = 0x40000;
+    const bool watchAll     = std::find(argv + 1, argv + argc, std::string_view("-watch-all")) != argv + argc;
     it = std::find(argv + 1, argv + argc, std::string_view("-watch-interval"));
     if (it != argv + argc && std::next(it) != argv + argc && !parseNum(*std::next(it), watchIntervalMs)) {
         std::cerr << std::format("[!] Invalid -watch-interval value: {}\n", *std::next(it));
@@ -164,6 +171,11 @@ int main(int argc, char* argv[]) {
     it = std::find(argv + 1, argv + argc, std::string_view("-max-concurrent"));
     if (it != argv + argc && std::next(it) != argv + argc && !parseNum(*std::next(it), maxConcurrent)) {
         std::cerr << std::format("[!] Invalid -max-concurrent value: {}\n", *std::next(it));
+        return 1;
+    }
+    it = std::find(argv + 1, argv + argc, std::string_view("-min-size"));
+    if (it != argv + argc && std::next(it) != argv + argc && !parseNum(*std::next(it), minRegionSize)) {
+        std::cerr << std::format("[!] Invalid -min-size value: {}\n", *std::next(it));
         return 1;
     }
 
@@ -218,7 +230,9 @@ int main(int argc, char* argv[]) {
     if (watchHidden) {
         Process::WatchHidden(hVMM, pid, outDir,
                              static_cast<uint32_t>(watchIntervalMs),
-                             static_cast<size_t>(maxConcurrent));
+                             static_cast<size_t>(maxConcurrent),
+                             watchAll,
+                             static_cast<size_t>(minRegionSize));
         VMMDLL_Close(hVMM);
         return 0;
     }

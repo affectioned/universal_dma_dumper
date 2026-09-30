@@ -56,18 +56,28 @@ public:
 
     // Continuous scan loop. Every intervalMs, walks the VAD tree via
     // ScanHiddenRegions and:
-    //   - logs '+ VA' when a new region appears
+    //   - logs '+ VA' when a new region appears (MZ, or >= minSize)
     //   - logs '- VA' when a previously seen region vanishes
-    //   - for each new MZ-flagged region, spawns a background PageWalker +
-    //     PEFixer that writes a snapshot to outDir. Regions present at
-    //     startup are treated as baseline (visible+dumped set) so only new
-    //     appearances after the tool starts trigger dumps.
+    //   - for each new candidate, spawns a background PageWalker + PEFixer
+    //     that writes a snapshot to outDir. Regions present at startup are
+    //     treated as baseline (visible+dumped set) so only new appearances
+    //     after the tool starts trigger dumps.
+    //
+    // Dump-selection rules:
+    //   - MZ-flagged: always dumped (highest confidence "this is a module").
+    //   - non-MZ:     dumped only when watchAll == true AND size >= minSize.
+    //                 Use this for manual-map loaders that wipe the PE header
+    //                 post-load — the fixer will fail but the raw dump is
+    //                 preserved for manual header reconstruction.
     //
     // maxConcurrent bounds active dump threads; over-the-cap candidates are
-    // logged as '!' skipped. Runs until END is pressed. Blocks the caller
-    // until all outstanding dumps complete.
+    // logged as '!' skipped. minSize acts as a noise floor for both logging
+    // and dumping — a small default (~256 KB) filters out JIT trampoline
+    // pool pages that dominate an unfiltered scan. Runs until END is pressed.
+    // Blocks the caller until all outstanding dumps complete.
     static void WatchHidden(VMM_HANDLE hVMM, DWORD pid, const std::string& outDir,
-                            uint32_t intervalMs, size_t maxConcurrent);
+                            uint32_t intervalMs, size_t maxConcurrent,
+                            bool watchAll, size_t minSize);
 
     // Resolves a module name pattern (substring or regex) against the module
     // list.  Returns the exact module name on a single match, or empty string

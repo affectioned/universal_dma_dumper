@@ -18,7 +18,7 @@ Original page-walker logic by [zarboz on UnknownCheats](https://www.unknowncheat
 universal_dma_dumper.exe -name <ProcessName> [-module <Name|Regex>] [-out <dir>]
 universal_dma_dumper.exe -name <ProcessName> -base 0x<VA> [-size 0x<N>]
 universal_dma_dumper.exe -name <ProcessName> -scan-hidden
-universal_dma_dumper.exe -name <ProcessName> -watch-hidden [-watch-interval <ms>] [-max-concurrent <N>]
+universal_dma_dumper.exe -name <ProcessName> -watch-hidden [-watch-interval <ms>] [-max-concurrent <N>] [-watch-all] [-min-size <bytes>]
 universal_dma_dumper.exe -name <ProcessName> -list-modules | -list-unloaded
 universal_dma_dumper.exe -list-drivers
 ```
@@ -33,6 +33,8 @@ universal_dma_dumper.exe -list-drivers
 | `-watch-hidden` | Continuous `-scan-hidden`; auto-dumps every new `MZ`-flagged region |
 | `-watch-interval` | Watch scan cadence in ms (default `250`) |
 | `-max-concurrent` | Concurrent background dumps under `-watch-hidden` (default `4`) |
+| `-watch-all` | Also auto-dump non-`MZ` regions (for manual-mappers that wipe the PE header post-load). PE fix will fail — raw `.bin` is preserved for manual reconstruction |
+| `-min-size` | Log/dump noise floor in bytes (default `0x40000` = 256 KB). Filters JIT trampoline pool pages. MZ candidates always pass regardless of size |
 | `-list-modules` | Module table with a **TP** column (`NORMAL` / `DATA` / `NOTLINK` / `INJECT`) |
 | `-list-unloaded` | Loader's unloaded-module ring (or `MmUnloadedDrivers` for `System`) |
 | `-list-drivers` | Kernel drivers (PID 4 modules) |

@@ -349,7 +349,8 @@ namespace {
 }
 
 void Process::WatchHidden(VMM_HANDLE hVMM, DWORD pid, const std::string& outDir,
-                          uint32_t intervalMs, size_t maxConcurrent) {
+                          uint32_t intervalMs, size_t maxConcurrent,
+                          bool watchAll, size_t minSize) {
     std::filesystem::create_directories(outDir);
 
     // visible: bases currently in the hidden set. Value counts consecutive
@@ -365,8 +366,10 @@ void Process::WatchHidden(VMM_HANDLE hVMM, DWORD pid, const std::string& outDir,
     std::atomic<size_t> active{ 0 };
     std::vector<std::thread> workers;
 
-    watchLog(std::format("Watch started (pid={}, interval={} ms, maxConcurrent={}, out={})",
-                         pid, intervalMs, maxConcurrent, outDir));
+    watchLog(std::format("Watch started (pid={}, interval={} ms, maxConcurrent={}, "
+                         "minSize=0x{:X}, watchAll={}, out={})",
+                         pid, intervalMs, maxConcurrent, minSize,
+                         watchAll ? "true" : "false", outDir));
     watchLog("Press END to stop (waits for outstanding dumps).");
 
     // ---------------- baseline pass ----------------
@@ -414,24 +417,42 @@ void Process::WatchHidden(VMM_HANDLE hVMM, DWORD pid, const std::string& outDir,
         }
         failStreak = 0;
 
-        std::unordered_set<ULONG64> currentSet;
-        currentSet.reserve(regions.size());
-        for (const auto& r : regions) currentSet.insert(r.vaStart);
+        // Track only bases that pass the log filter so disappearances of
+        // below-threshold noise don't fire '-' events for things we never
+        // announced a '+' for.
+        std::unordered_set<ULONG64> loggedThisTick;
+        loggedThisTick.reserve(regions.size());
 
         // 1) Appearances — regions in current scan but not previously visible.
         for (const auto& r : regions) {
+            const ULONG64 regionSize = r.vaEnd - r.vaStart;
+
+            // Log filter: skip small non-MZ noise (JIT trampoline pool pages,
+            // 4-16 KB private-RX pages that appear/disappear constantly under
+            // active JavaScript/Panorama load). MZ candidates always logged
+            // regardless of size — a 4 KB MZ region is a stub loader worth
+            // seeing.
+            const bool worthLogging = r.hasMZ || regionSize >= minSize;
+            if (!worthLogging) continue;
+            loggedThisTick.insert(r.vaStart);
+
             if (visible.contains(r.vaStart)) continue;
             visible[r.vaStart] = 0;
 
             watchLog(std::format("+ 0x{:016X}  size=0x{:X}  {}  vad='{}'",
-                                 r.vaStart, r.vaEnd - r.vaStart,
+                                 r.vaStart, regionSize,
                                  r.hasMZ ? "MZ" : "--",
                                  r.vadText.empty() ? std::string("(none)") : r.vadText));
 
-            // Only auto-dump MZ candidates. Non-MZ regions are usually JIT
-            // trampolines / shellcode payloads — interesting but noisy and
-            // usually not what a VAC hunt wants.
-            if (!r.hasMZ)                          continue;
+            // Dump selection:
+            //   - MZ candidates: always dumped, per-page-size or SizeOfImage.
+            //   - non-MZ:        only when watchAll==true. Use for modules
+            //                    that wipe their PE header post-load — the
+            //                    fixer will fail (no MZ/PE at base), but the
+            //                    raw .bin is preserved for manual header
+            //                    reconstruction.
+            const bool shouldDump = r.hasMZ || watchAll;
+            if (!shouldDump)                       continue;
             if (dumped.contains(r.vaStart))        continue;
 
             if (active.load() >= maxConcurrent) {
@@ -446,7 +467,7 @@ void Process::WatchHidden(VMM_HANDLE hVMM, DWORD pid, const std::string& outDir,
             const ULONG64 base = r.vaStart;
             const DWORD   size = r.peSizeOfImage
                                  ? r.peSizeOfImage
-                                 : static_cast<DWORD>(r.vaEnd - r.vaStart);
+                                 : static_cast<DWORD>(regionSize);
 
             workers.emplace_back([hVMM, pid, base, size, outDir, &active]() {
                 const std::string rawFile   = std::format("{}/hidden_{:016X}_raw.bin",   outDir, base);
@@ -469,10 +490,13 @@ void Process::WatchHidden(VMM_HANDLE hVMM, DWORD pid, const std::string& outDir,
             });
         }
 
-        // 2) Disappearances — bases we were tracking but are no longer in scan.
-        //    Kept in `dumped` so a flap doesn't retrigger a walk on the same VA.
+        // 2) Disappearances — bases we were tracking but are no longer in the
+        //    filtered current-tick set. Kept in `dumped` so a flap doesn't
+        //    retrigger a walk on the same VA. (currentSet is built from all
+        //    scanned regions and used only for erase-vs-keep bookkeeping on
+        //    `dumped`; visible-set tracking uses the filtered loggedThisTick.)
         for (auto it = visible.begin(); it != visible.end(); ) {
-            if (currentSet.contains(it->first)) { ++it; continue; }
+            if (loggedThisTick.contains(it->first)) { ++it; continue; }
             watchLog(std::format("- 0x{:016X}  vanished", it->first));
             it = visible.erase(it);
         }
